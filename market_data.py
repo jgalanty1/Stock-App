@@ -15,7 +15,10 @@ All functions degrade gracefully if APIs unavailable.
 import os
 import json
 import logging
+import re
+import statistics
 import time
+import threading
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
@@ -26,14 +29,31 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # ============================================================================
 
-FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
 FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
 
 # Cache directory for market data
 MARKET_DATA_DIR = os.environ.get("MARKET_DATA_DIR", "sec_data/market_data")
 
 # Backtesting windows (days after filing)
-BACKTEST_WINDOWS = [30, 60, 90, 180]
+BACKTEST_WINDOWS = (30, 60, 90, 180)  # Fix 46: immutable tuple
+
+
+def _load_config_key(key_name: str) -> str:
+    """Load API key from config.json."""
+    try:
+        config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                config = json.load(f)
+            return config.get(key_name, '')
+    except Exception:
+        pass
+    return ''
+
+
+def _get_fmp_key() -> str:
+    """Get FMP API key from environment or config (not cached at import time)."""
+    return os.environ.get('FMP_API_KEY') or _load_config_key('fmp_api_key')
 
 
 # ============================================================================
@@ -41,24 +61,29 @@ BACKTEST_WINDOWS = [30, 60, 90, 180]
 # ============================================================================
 
 _session = None
+_session_lock = threading.Lock()
 
 
 def _get_session():
     global _session
-    if _session is None:
-        import requests
-        _session = requests.Session()
-        _session.headers.update({
-            "User-Agent": os.environ.get("SEC_USER_AGENT",
-                                         "MarketData/1.0 (user@example.com)"),
-            "Accept-Encoding": "gzip, deflate",
-        })
+    with _session_lock:
+        if _session is None:
+            import requests
+            _session = requests.Session()
+            ua = os.environ.get("SEC_USER_AGENT", "")
+            if not ua:
+                logger.warning("SEC_USER_AGENT not set — EDGAR requests may be blocked")
+            _session.headers.update({
+                "User-Agent": ua,
+                "Accept-Encoding": "gzip, deflate",
+            })
     return _session
 
 
 def _fmp_request(endpoint: str, params: dict = None) -> Optional[Any]:
     """Make FMP API request with error handling."""
-    if not FMP_API_KEY:
+    fmp_key = _get_fmp_key()
+    if not fmp_key:
         logger.debug("FMP_API_KEY not set, skipping market data request")
         return None
 
@@ -66,12 +91,16 @@ def _fmp_request(endpoint: str, params: dict = None) -> Optional[Any]:
     url = f"{FMP_BASE_URL}/{endpoint}"
     if params is None:
         params = {}
-    params["apikey"] = FMP_API_KEY
+    params["apikey"] = fmp_key
 
     try:
         resp = session.get(url, params=params, timeout=15)
         if resp.status_code == 200:
-            return resp.json()
+            try:
+                return resp.json()
+            except json.JSONDecodeError as e:
+                logger.warning(f"FMP invalid JSON response from {url}: {e}")
+                return None
         logger.warning(f"FMP {resp.status_code}: {url}")
     except Exception as e:
         logger.warning(f"FMP request failed: {e}")
@@ -79,11 +108,12 @@ def _fmp_request(endpoint: str, params: dict = None) -> Optional[Any]:
 
 
 # ============================================================================
-# 1. PRICE TRACKING & BACKTESTING (#1)
+# 1. PRICE TRACKING & BACKTESTING (Engine integration priority #1)
 # ============================================================================
 
 # Price cache to avoid redundant fetches within a session
 _price_cache = {}
+_cache_lock = threading.Lock()
 
 
 def fetch_price_history(ticker: str, days: int = 730) -> Optional[List[Dict]]:
@@ -93,19 +123,22 @@ def fetch_price_history(ticker: str, days: int = 730) -> Optional[List[Dict]]:
 
     # Check session cache
     cache_key = f"{ticker}_{days}"
-    if cache_key in _price_cache:
-        return _price_cache[cache_key]
+    with _cache_lock:
+        if cache_key in _price_cache:
+            return _price_cache[cache_key]
 
     result = None
+    source = "unknown"
 
     # Try FMP first (if key is set)
-    if FMP_API_KEY:
+    if _get_fmp_key():
         try:
             data = _fmp_request(f"historical-price-full/{ticker}", {
                 "timeseries": days,
             })
             if data and isinstance(data, dict) and "historical" in data:
                 result = data["historical"]  # Newest first
+                source = "fmp"
                 logger.debug(f"Price data for {ticker}: {len(result)} days from FMP")
         except Exception as e:
             logger.debug(f"FMP price fetch failed for {ticker}: {e}")
@@ -114,23 +147,26 @@ def fetch_price_history(ticker: str, days: int = 730) -> Optional[List[Dict]]:
     if not result:
         try:
             import yfinance as yf
-            end_date = datetime.now()
+            end_date = datetime.now()  # Note: uses local timezone
             start_date = end_date - timedelta(days=days)
             tk = yf.Ticker(ticker)
             df = tk.history(start=start_date.strftime('%Y-%m-%d'),
                            end=end_date.strftime('%Y-%m-%d'))
             if df is not None and len(df) > 0:
                 result = []
+                # Normalize column names to handle case variations (fix 37)
+                col_map = {c.lower(): c for c in df.columns}
                 for idx, row in df.iterrows():
                     result.append({
                         "date": idx.strftime('%Y-%m-%d'),
-                        "open": round(float(row.get('Open', 0)), 4),
-                        "close": round(float(row.get('Close', 0)), 4),
-                        "high": round(float(row.get('High', 0)), 4),
-                        "low": round(float(row.get('Low', 0)), 4),
-                        "volume": int(row.get('Volume', 0)),
+                        "open": round(float(row.get(col_map.get('open', 'Open'), 0)), 4),
+                        "close": round(float(row.get(col_map.get('close', 'Close'), 0)), 4),
+                        "high": round(float(row.get(col_map.get('high', 'High'), 0)), 4),
+                        "low": round(float(row.get(col_map.get('low', 'Low'), 0)), 4),
+                        "volume": int(row.get(col_map.get('volume', 'Volume'), 0)),
                     })
                 result.sort(key=lambda x: x['date'], reverse=True)  # Newest first
+                source = "yfinance"
                 logger.debug(f"Price data for {ticker}: {len(result)} days from yfinance")
         except ImportError:
             logger.warning(
@@ -141,16 +177,27 @@ def fetch_price_history(ticker: str, days: int = 730) -> Optional[List[Dict]]:
             logger.debug(f"yfinance price fetch failed for {ticker}: {e}")
 
     if result:
-        _price_cache[cache_key] = result
+        with _cache_lock:
+            _price_cache[cache_key] = result
+        # Store source alongside cache for later retrieval
+        with _cache_lock:
+            _price_cache[f"{cache_key}_source"] = source
     return result
+
+
+def clear_price_cache():
+    """Clear the in-memory price cache."""
+    global _price_cache
+    with _cache_lock:
+        _price_cache.clear()
 
 
 def get_price_at_date(ticker: str, target_date: str,
                       history: List[Dict] = None) -> Optional[float]:
     """Get closing price on or near a specific date."""
-    if not history:
+    if history is None or len(history) == 0:
         history = fetch_price_history(ticker, 365)
-    if not history:
+    if history is None or len(history) == 0:
         return None
 
     # Find closest date (prices might not exist on weekends/holidays)
@@ -188,7 +235,10 @@ def compute_backtest(ticker: str, filing_date: str,
         )
         return result
 
-    result["price_source"] = "fmp" if FMP_API_KEY else "yfinance"
+    # Track which source actually provided the data
+    source_key = f"{ticker}_730_source"
+    with _cache_lock:
+        result["price_source"] = _price_cache.get(source_key, "unknown")
     result["price_points"] = len(history)
 
     base_price = get_price_at_date(ticker, filing_date, history)
@@ -222,10 +272,122 @@ def compute_backtest(ticker: str, filing_date: str,
             if change_pct >= 15:
                 result["hit"] = True
 
+    # Compute benchmark returns and alpha
+    try:
+        bench = compute_benchmark_return(filing_date)
+        if bench.get("windows"):
+            result["benchmark"] = bench.get("benchmark", "IWC")
+            result["benchmark_return"] = {}
+            for w_key, w_data in result["windows"].items():
+                bench_w = bench["windows"].get(w_key, {})
+                bench_change = bench_w.get("change_pct")
+                if bench_change is not None:
+                    result["benchmark_return"][w_key] = bench_change
+                    alpha = round(w_data["change_pct"] - bench_change, 2)
+                    w_data["benchmark_return"] = bench_change
+                    w_data["alpha"] = alpha
+                    result[f"alpha_{w_key}d"] = alpha
+    except Exception as e:
+        logger.debug(f"Benchmark computation failed for {ticker}: {e}")
+
     return result
 
 
-def batch_backtest(filings: List[Dict], data_dir: str = None) -> List[Dict]:
+# Benchmark cache for alpha computation
+_benchmark_cache = {}
+_benchmark_cache_loaded = False
+_bench_lock = threading.Lock()
+_BENCHMARK_CACHE_FILE = os.path.join(
+    os.environ.get("MARKET_DATA_DIR", "sec_data/market_data"),
+    "benchmark_cache.json",
+)
+
+
+def compute_benchmark_return(filing_date: str, benchmark: str = "IWC") -> Dict:
+    """
+    Compute benchmark (IWC micro-cap ETF) returns for same windows as stock backtests.
+    Falls back to IWM (Russell 2000) if IWC unavailable.
+    Returns {benchmark, filing_date, windows: {30: {change_pct, ...}, ...}}
+    """
+    global _benchmark_cache, _benchmark_cache_loaded
+
+    cache_key = f"{benchmark}_{filing_date}"
+    with _bench_lock:
+        if cache_key in _benchmark_cache:
+            return _benchmark_cache[cache_key]
+
+    # Load file cache on first access (fix 27)
+    with _bench_lock:
+        if not _benchmark_cache_loaded:
+            _benchmark_cache_loaded = True
+            cache_dir = os.path.dirname(_BENCHMARK_CACHE_FILE)
+            os.makedirs(cache_dir, exist_ok=True)
+            if os.path.exists(_BENCHMARK_CACHE_FILE):
+                try:
+                    with open(_BENCHMARK_CACHE_FILE) as f:
+                        _benchmark_cache = json.load(f)
+                    if cache_key in _benchmark_cache:
+                        return _benchmark_cache[cache_key]
+                except (json.JSONDecodeError, KeyError) as e:
+                    logger.warning(f"Benchmark cache load failed: {e}")
+                    _benchmark_cache = {}
+                except Exception:
+                    pass
+
+    result = {
+        "benchmark": benchmark,
+        "filing_date": filing_date,
+        "windows": {},
+    }
+
+    # Try IWC first, fallback to IWM
+    for ticker in ([benchmark, "IWM"] if benchmark == "IWC" else [benchmark]):
+        history = fetch_price_history(ticker, 730)
+        if not history:
+            continue
+
+        base_price = get_price_at_date(ticker, filing_date, history)
+        if not base_price or base_price <= 0:
+            continue
+
+        result["benchmark"] = ticker
+        result["base_price"] = base_price
+
+        try:
+            base_dt = datetime.strptime(filing_date[:10], "%Y-%m-%d")
+        except ValueError:
+            break
+
+        for window in BACKTEST_WINDOWS:
+            future_date = (base_dt + timedelta(days=window)).strftime("%Y-%m-%d")
+            future_price = get_price_at_date(ticker, future_date, history)
+            if future_price and future_price > 0:
+                change_pct = round((future_price - base_price) / base_price * 100, 2)
+                result["windows"][str(window)] = {
+                    "days": window,
+                    "price": future_price,
+                    "change_pct": change_pct,
+                    "date": future_date,
+                }
+        break  # Got data, stop trying fallbacks
+
+    # Cache result
+    with _bench_lock:
+        _benchmark_cache[cache_key] = result
+    try:
+        # Atomic write via tmp + os.replace
+        tmp_file = _BENCHMARK_CACHE_FILE + ".tmp"
+        with open(tmp_file, "w") as f:
+            json.dump(_benchmark_cache, f)
+        os.replace(tmp_file, _BENCHMARK_CACHE_FILE)
+    except Exception:
+        pass
+
+    return result
+
+
+def batch_backtest(filings: List[Dict], data_dir: str = None,
+                   db_sync: bool = False) -> List[Dict]:
     """Run backtesting on a list of filings. Caches results."""
     if data_dir is None:
         data_dir = MARKET_DATA_DIR
@@ -237,14 +399,28 @@ def batch_backtest(filings: List[Dict], data_dir: str = None) -> List[Dict]:
     if os.path.exists(cache_file):
         try:
             with open(cache_file) as f:
-                cached = {r["ticker"] + "_" + r["filing_date"]: r
-                          for r in json.load(f)}
+                data = json.load(f)
+            cached = {r["ticker"] + "_" + r["filing_date"]: r
+                      for r in data}
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Backtest cache corrupted, rebuilding: {e}")
+            cached = {}
         except Exception:
             cached = {}
 
     results = []
     total = len(filings)
     errors = 0
+
+    # Create DB connection once before loop (not per-filing)
+    _db = None
+    if db_sync:
+        try:
+            from database import SECDatabase
+            _db = SECDatabase(data_dir=os.environ.get("SEC_DATA_DIR", "sec_data"))
+        except Exception as e:
+            logger.debug(f"DB connection failed, will skip sync: {e}")
+
     for i, filing in enumerate(filings):
         ticker = filing.get("ticker", "")
         fdate = filing.get("filing_date", "")
@@ -265,12 +441,20 @@ def batch_backtest(filings: List[Dict], data_dir: str = None) -> List[Dict]:
         cached[key] = result
         results.append(result)
 
+        # Sync to database if requested
+        if _db and not result.get("error"):
+            try:
+                _db.save_backtest(ticker, fdate, result)
+            except Exception as e:
+                logger.debug(f"DB sync failed for {ticker}: {e}")
+
         # Log progress every 10 filings
         if (i + 1) % 10 == 0 or i == total - 1:
             logger.info(f"Backtest progress: {i+1}/{total} "
                         f"({errors} errors so far)")
 
-        time.sleep(0.3)  # Rate limit
+        # TODO: Use RateLimiter from scraper.py for proper coordination
+        time.sleep(0.3)  # Simple rate limit between backtest fetches
 
     # Save cache
     try:
@@ -295,20 +479,28 @@ def compute_backtest_stats(results: List[Dict]) -> Dict:
     for window in BACKTEST_WINDOWS:
         w_key = str(window)
         gains = []
+        alphas = []
         for r in results:
             w = r.get("windows", {}).get(w_key)
             if w:
                 gains.append(w["change_pct"])
+                if w.get("alpha") is not None:
+                    alphas.append(w["alpha"])
         if gains:
-            stats["by_window"][w_key] = {
+            w_stats = {
                 "count": len(gains),
                 "avg_return": round(sum(gains) / len(gains), 2),
-                "median_return": round(sorted(gains)[len(gains) // 2], 2),
+                "median_return": round(statistics.median(gains), 2),
                 "win_rate": round(sum(1 for g in gains if g > 0) / len(gains) * 100, 1),
                 "big_win_rate": round(sum(1 for g in gains if g >= 15) / len(gains) * 100, 1),
                 "max_gain": round(max(gains), 2) if gains else 0,
                 "max_loss": round(min(gains), 2) if gains else 0,
             }
+            if alphas:
+                w_stats["avg_alpha"] = round(sum(alphas) / len(alphas), 2)
+                w_stats["alpha_win_rate"] = round(
+                    sum(1 for a in alphas if a > 0) / len(alphas) * 100, 1)
+            stats["by_window"][w_key] = w_stats
 
     # Score bucket analysis
     for bucket_name, min_score, max_score in [
@@ -337,7 +529,7 @@ def compute_backtest_stats(results: List[Dict]) -> Dict:
 
 
 # ============================================================================
-# 2. SHORT INTEREST DATA (#13)
+# 2. SHORT INTEREST DATA (CPS signal #13)
 # ============================================================================
 
 def fetch_short_interest(ticker: str) -> Optional[Dict]:
@@ -362,14 +554,22 @@ def fetch_short_interest(ticker: str) -> Optional[Dict]:
             "fetched_at": datetime.now().isoformat(),
         }
 
-    # Fallback: try key-metrics endpoint which sometimes has short data
+    # Fallback: try key-metrics endpoint which sometimes has liquidity data
+    # Note: shortTermCoverageRatios is a liquidity metric, not short interest.
+    # We include it as a supplementary liquidity signal, not for short squeeze analysis.
     metrics = _fmp_request(f"key-metrics/{ticker}", {"limit": 1})
     if metrics and isinstance(metrics, list) and len(metrics) > 0:
         m = metrics[0]
-        if m.get("shortTermCoverageRatios"):
+        liquidity_ratio = m.get("shortTermCoverageRatios")
+        if liquidity_ratio:
             return {
                 "ticker": ticker,
-                "short_ratio": m.get("shortTermCoverageRatios", 0),
+                "date": "",
+                "short_interest": 0,
+                "short_ratio": 0,
+                "short_pct_float": 0,
+                "days_to_cover": 0,
+                "liquidity_ratio": liquidity_ratio,
                 "source": "fmp_metrics",
                 "fetched_at": datetime.now().isoformat(),
             }
@@ -412,7 +612,7 @@ def is_short_squeeze_candidate(short_data: Dict, insider_data: Dict = None,
 
 
 # ============================================================================
-# 3. 13F INSTITUTIONAL OWNERSHIP (#14)
+# 3. 13F INSTITUTIONAL OWNERSHIP (CPS signal #14)
 # ============================================================================
 
 def fetch_institutional_holders(ticker: str) -> Optional[List[Dict]]:
@@ -458,7 +658,7 @@ def analyze_institutional_changes(holders: List[Dict]) -> Dict:
 
 
 # ============================================================================
-# 4. PEER COMPARISON (#5)
+# 4. PEER COMPARISON (CPS dimension #5)
 # ============================================================================
 
 def fetch_sector_peers(ticker: str) -> Optional[List[str]]:
@@ -505,6 +705,7 @@ def compute_peer_comparison(ticker: str, peers: List[str] = None) -> Optional[Di
         m = fetch_sector_metrics(p)
         if m:
             peer_metrics.append({"ticker": p, **m})
+        # TODO: Coordinate with RateLimiter from scraper.py for shared FMP rate limit
         time.sleep(0.2)
 
     if not peer_metrics:
@@ -525,8 +726,12 @@ def compute_peer_comparison(ticker: str, peers: List[str] = None) -> Optional[Di
 
     if peer_pes and company.get("pe_ratio"):
         avg_pe = sum(peer_pes) / len(peer_pes)
-        comparison["pe_vs_peers"] = round(company["pe_ratio"] / avg_pe, 2) if avg_pe else None
-        comparison["pe_discount"] = round((1 - company["pe_ratio"] / avg_pe) * 100, 1) if avg_pe else 0
+        if abs(avg_pe) < 0.01:
+            comparison["pe_vs_peers"] = None
+            comparison["pe_discount"] = 0
+        else:
+            comparison["pe_vs_peers"] = round(company["pe_ratio"] / avg_pe, 2)
+            comparison["pe_discount"] = round((1 - company["pe_ratio"] / avg_pe) * 100, 1)
 
     if peer_ptbs and company.get("price_to_book"):
         avg_ptb = sum(peer_ptbs) / len(peer_ptbs)
@@ -563,7 +768,7 @@ def format_peer_comparison_for_prompt(comparison: Dict) -> str:
 
 
 # ============================================================================
-# 5. EARNINGS CALL TRANSCRIPTS (#12)
+# 5. EARNINGS CALL TRANSCRIPTS (CPS signal #12)
 # ============================================================================
 
 def fetch_earnings_transcript(ticker: str, year: int = None,
@@ -612,50 +817,163 @@ def fetch_latest_transcript(ticker: str) -> Optional[Dict]:
 
 
 def extract_transcript_signals(transcript: Dict) -> Dict:
-    """Extract key signals from earnings call transcript text."""
+    """
+    Extract key signals from earnings call transcript text.
+    Produces both categorical signals and a numeric 0-100 transcript_score.
+    """
     content = transcript.get("content", "")
     if not content:
-        return {"signals": [], "summary": ""}
+        return {"signals": [], "summary": "", "transcript_score": 50}
 
     content_lower = content.lower()
+    words = content.split()
+    word_count = len(words)
 
     signals = []
+    score_adj = 0  # adjustments from neutral 50
 
-    # Guidance language
+    # ---- Guidance language ----
     positive_guidance = ["raised guidance", "increased guidance", "raised our",
                          "above expectations", "ahead of plan", "accelerat",
-                         "record revenue", "record quarter", "record earnings"]
+                         "record revenue", "record quarter", "record earnings",
+                         "exceeded expectations", "outperformed", "beat consensus",
+                         "upside surprise", "stronger than expected"]
     negative_guidance = ["lowered guidance", "reduced guidance", "below expectations",
-                         "headwinds", "challenging environment", "restructur"]
+                         "headwinds", "challenging environment", "restructur",
+                         "missed expectations", "shortfall", "deteriorat",
+                         "weaker than expected", "downside", "going concern"]
 
     for phrase in positive_guidance:
         if phrase in content_lower:
             signals.append({"type": "positive_guidance", "phrase": phrase})
-
+            score_adj += 3
     for phrase in negative_guidance:
         if phrase in content_lower:
             signals.append({"type": "negative_guidance", "phrase": phrase})
+            score_adj -= 3
 
-    # Catalyst keywords
+    # ---- Catalyst keywords ----
     catalyst_phrases = ["strategic alternatives", "exploring options",
                         "acquisition", "merger", "buyback", "share repurchase",
                         "special dividend", "spin-off", "spinoff",
-                        "activist", "board seats", "management change"]
+                        "activist", "board seats", "management change",
+                        "strategic review", "privatization", "going private"]
     for phrase in catalyst_phrases:
         if phrase in content_lower:
             signals.append({"type": "catalyst", "phrase": phrase})
+            score_adj += 2
+
+    # ---- Loughran-McDonald sentiment scoring ----
+    # Subset of high-signal LM positive/negative words for speed
+    LM_POSITIVE = {
+        "achieve", "attain", "benefit", "efficient", "enhance", "excellent",
+        "favorable", "gain", "improve", "leader", "opportunity", "outperform",
+        "positive", "profit", "profitab", "progress", "strength", "strong",
+        "succeed", "superior", "surpass", "upturn", "uptick",
+    }
+    LM_NEGATIVE = {
+        "adverse", "against", "breach", "burden", "closure", "decline",
+        "default", "deficit", "delay", "deteriorat", "difficult", "disappoint",
+        "downturn", "impair", "inability", "insolven", "lawsuit", "layoff",
+        "litigat", "loss", "negativ", "penalty", "problem", "risk",
+        "shortage", "slowdown", "terminat", "threat", "unfavorab", "weak",
+    }
+
+    pos_count = 0
+    neg_count = 0
+    for w in words:
+        wl = w.lower().strip(".,;:!?()\"'")
+        for p in LM_POSITIVE:
+            if wl.startswith(p):
+                pos_count += 1
+                break
+        for n in LM_NEGATIVE:
+            if wl.startswith(n):
+                neg_count += 1
+                break
+
+    total_sentiment_words = pos_count + neg_count
+    if total_sentiment_words > 0:
+        sentiment_ratio = (pos_count - neg_count) / total_sentiment_words
+    else:
+        sentiment_ratio = 0
+
+    # Scale: sentiment_ratio ranges roughly -1 to +1
+    lm_sentiment_score = max(0, min(100, 50 + sentiment_ratio * 30))
+    score_adj += int(sentiment_ratio * 10)
+
+    # ---- Management tone analysis ----
+    # Confidence indicators
+    confidence_phrases = ["confident", "conviction", "committed to", "well positioned",
+                          "on track", "executing well", "ahead of schedule", "momentum"]
+    uncertainty_phrases = ["uncertain", "unpredictable", "volatility", "cautious",
+                           "prudent", "conservative estimate", "visibility is limited",
+                           "difficult to predict"]
+
+    confidence_count = sum(1 for p in confidence_phrases if p in content_lower)
+    uncertainty_count = sum(1 for p in uncertainty_phrases if p in content_lower)
+
+    if confidence_count > uncertainty_count + 2:
+        signals.append({"type": "tone", "phrase": f"management_confident ({confidence_count} vs {uncertainty_count})"})
+        score_adj += 4
+    elif uncertainty_count > confidence_count + 2:
+        signals.append({"type": "tone", "phrase": f"management_uncertain ({uncertainty_count} vs {confidence_count})"})
+        score_adj -= 4
+
+    # ---- Forward-looking statements density ----
+    forward_phrases = ["expect", "anticipate", "project", "forecast", "outlook",
+                       "looking ahead", "going forward", "next quarter", "next year",
+                       "pipeline", "backlog", "order book"]
+    forward_count = sum(1 for p in forward_phrases if p in content_lower)
+    forward_density = forward_count / max(1, word_count) * 1000
+    # High forward density suggests management willing to provide visibility
+    if forward_density > 5:
+        score_adj += 2
+
+    # ---- Numeric guidance extraction ----
+    # Look for specific numeric targets in guidance
+    guidance_patterns = [
+        r'(?:revenue|sales)\s+(?:of|between|range)\s+\$[\d,.]+',
+        r'(?:eps|earnings per share)\s+(?:of|between|range)\s+\$[\d,.]+',
+        r'(?:margin|margins)\s+(?:of|to|between)\s+[\d,.]+%',
+        r'(?:growth|increase)\s+(?:of|between)\s+[\d,.]+%',
+    ]
+    numeric_guidance = []
+    for pat in guidance_patterns:
+        matches = re.findall(pat, content_lower)
+        numeric_guidance.extend(matches[:3])
+
+    if numeric_guidance:
+        signals.append({"type": "numeric_guidance", "phrase": "; ".join(numeric_guidance[:5])})
+        score_adj += 2  # Specificity is positive
+
+    # ---- Compute final transcript score ----
+    transcript_score = max(0, min(100, 50 + score_adj))
+
+    positive_count = sum(1 for s in signals if s["type"] == "positive_guidance")
+    negative_count = sum(1 for s in signals if s["type"] == "negative_guidance")
+    catalyst_count = sum(1 for s in signals if s["type"] == "catalyst")
 
     return {
         "signals": signals,
-        "positive_count": sum(1 for s in signals if s["type"] == "positive_guidance"),
-        "negative_count": sum(1 for s in signals if s["type"] == "negative_guidance"),
-        "catalyst_count": sum(1 for s in signals if s["type"] == "catalyst"),
-        "word_count": len(content.split()),
+        "positive_count": positive_count,
+        "negative_count": negative_count,
+        "catalyst_count": catalyst_count,
+        "word_count": word_count,
+        "transcript_score": transcript_score,
+        "lm_sentiment_score": round(lm_sentiment_score, 1),
+        "sentiment_ratio": round(sentiment_ratio, 3),
+        "lm_positive_words": pos_count,
+        "lm_negative_words": neg_count,
+        "confidence_count": confidence_count,
+        "uncertainty_count": uncertainty_count,
+        "forward_density": round(forward_density, 2),
+        "numeric_guidance_found": len(numeric_guidance),
     }
 
 
 # ============================================================================
-# 6. QUANTITATIVE PRE-FILTER (#11)
+# 6. QUANTITATIVE PRE-FILTER (CPS signal #11)
 # ============================================================================
 
 def fetch_quant_screen_data(ticker: str) -> Optional[Dict]:
@@ -758,7 +1076,7 @@ def quant_prefilter_score(data: Dict) -> Tuple[float, List[str]]:
 
 
 # ============================================================================
-# 7. INSIDER TIMING CORRELATION (#4)
+# 7. INSIDER TIMING CORRELATION (CPS dimension #4)
 # ============================================================================
 
 def correlate_insider_timing(insider_data: Dict, filing_date: str) -> Dict:

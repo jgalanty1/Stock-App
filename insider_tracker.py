@@ -19,7 +19,7 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +32,6 @@ def _normalize_form(form_type: str) -> str:
     ft = ft.replace("SCHEDULE 13G/A", "SC 13G/A")
     ft = ft.replace("SCHEDULE 13G", "SC 13G")
     return ft
-
-# EDGAR XML namespaces for Form 4
-FORM4_NS = {
-    '': 'http://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0000000000&type=4&dateb=&owner=include&count=40',
-}
 
 # ============================================================================
 # FORM 4 FETCHING & PARSING
@@ -63,6 +58,7 @@ def fetch_insider_transactions(cik: str, session, limiter,
     accessions = recent.get("accessionNumber", [])
     primary_docs = recent.get("primaryDocument", [])
 
+    # Date strings must be ISO format (YYYY-MM-DD) for string comparison to work correctly
     cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     cik_num = cik.lstrip('0')
 
@@ -107,8 +103,15 @@ def _fetch_and_parse_form4(url: str, filing_date: str,
     """Fetch a single Form 4 XML and extract transaction details."""
     from scraper import _safe_request
 
+    # _safe_request returns parsed JSON for .json URLs, raw text for others.
+    # Form 4 XMLs come back as raw text strings, so we fall back to text handling.
     content = _safe_request(session, url, limiter=limiter)
     if not content or not isinstance(content, str):
+        return []
+
+    # Input size limit to prevent excessive memory usage
+    if len(content) > 10_000_000:
+        logger.warning("XML too large (%d bytes), skipping", len(content))
         return []
 
     # Form 4 can be XML or HTML wrapper around XML
@@ -117,7 +120,7 @@ def _fetch_and_parse_form4(url: str, filing_date: str,
     try:
         # Try direct XML parse
         root = ET.fromstring(content)
-    except ET.ParseError:
+    except ET.ParseError as e:
         # Try to extract XML from HTML
         xml_match = re.search(r'<ownershipDocument>(.*?)</ownershipDocument>',
                               content, re.DOTALL | re.IGNORECASE)
@@ -126,27 +129,41 @@ def _fetch_and_parse_form4(url: str, filing_date: str,
                 root = ET.fromstring(
                     f'<ownershipDocument>{xml_match.group(1)}</ownershipDocument>'
                 )
-            except ET.ParseError:
+            except ET.ParseError as e2:
+                logger.warning("Failed to parse Form 4 XML: %s", e2)
                 return []
         else:
+            logger.warning("Failed to parse Form 4 XML: %s", e)
             return []
 
-    # Extract reporting owner info
-    owner_name = ""
-    owner_relationship = ""
+    # Extract reporting owner info — collect all owners from the document
+    owners = []
+    current_owner_name = ""
+    current_owner_relationship = ""
     for owner_elem in root.iter():
         if 'rptOwnerName' in owner_elem.tag:
-            owner_name = (owner_elem.text or "").strip()
+            # Save previous owner if we're starting a new one
+            if current_owner_name:
+                owners.append({"name": current_owner_name, "relationship": current_owner_relationship})
+            current_owner_name = (owner_elem.text or "").strip()
+            current_owner_relationship = ""
         elif 'isDirector' in owner_elem.tag and (owner_elem.text or "").strip() == "1":
-            owner_relationship = "director" if not owner_relationship else owner_relationship
+            current_owner_relationship = "director" if not current_owner_relationship else current_owner_relationship
         elif 'isOfficer' in owner_elem.tag and (owner_elem.text or "").strip() == "1":
-            owner_relationship = "officer"
+            current_owner_relationship = "officer"
         elif 'isTenPercentOwner' in owner_elem.tag and (owner_elem.text or "").strip() == "1":
-            owner_relationship = "10pct_owner" if not owner_relationship else owner_relationship
+            current_owner_relationship = "10pct_owner" if not current_owner_relationship else current_owner_relationship
         elif 'officerTitle' in owner_elem.tag and owner_elem.text:
             officer_title = owner_elem.text.strip()
             if officer_title:
-                owner_relationship = f"officer:{officer_title}"
+                current_owner_relationship = f"officer:{officer_title}"
+    # Don't forget the last owner
+    if current_owner_name:
+        owners.append({"name": current_owner_name, "relationship": current_owner_relationship})
+
+    # Use first owner as default for transactions (most Form 4s have one owner)
+    owner_name = owners[0]["name"] if owners else ""
+    owner_relationship = owners[0]["relationship"] if owners else ""
 
     # Extract non-derivative transactions
     for txn in root.iter():
@@ -292,7 +309,7 @@ def fetch_institutional_filings(cik: str, session, limiter,
     appear under the target company's CIK submissions. We use EDGAR EFTS
     full-text search to find them.
     """
-    from scraper import _safe_request, _edgar_limiter
+    from scraper import _safe_request
 
     institutional_forms = {"SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A"}
     cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
@@ -301,7 +318,7 @@ def fetch_institutional_filings(cik: str, session, limiter,
     filings = []
 
     # ---- EFTS search for filings mentioning this company ----
-    from scraper import _efts_search, _edgar_limiter as edgar_lim
+    from scraper import _efts_search
 
     search_terms = []
     # Company name first — SC 13D filings reference target by name, not ticker

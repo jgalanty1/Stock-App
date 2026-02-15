@@ -16,14 +16,13 @@ import os
 import json
 import sqlite3
 import logging
-import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 -- Universe: companies tracked
@@ -164,23 +163,49 @@ class SECDatabase:
         self._init_db()
 
     def _init_db(self):
-        """Create schema if needed."""
+        """Create schema if needed, then run migrations."""
         with self._conn() as conn:
             conn.executescript(SCHEMA_SQL)
+            # Set WAL journal mode (persists across connections, only needs to be set once)
+            conn.execute("PRAGMA journal_mode=WAL")
             # Set schema version
             conn.execute(
                 "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
                 ("schema_version", str(SCHEMA_VERSION))
             )
-            conn.commit()
+            # Run schema migrations
+            self._migrate_v2(conn)
         logger.info(f"SQLite database initialized at {self.db_path}")
+
+    def _migrate_v2(self, conn):
+        """Add v2 columns to backtest_results for signal vectors, benchmark, alpha."""
+        # Check which columns already exist
+        existing = {row[1] for row in conn.execute(
+            "PRAGMA table_info(backtest_results)").fetchall()}
+        new_columns = {
+            "signal_vector": "TEXT",
+            "benchmark_return": "TEXT",
+            "alpha_30d": "REAL",
+            "alpha_60d": "REAL",
+            "alpha_90d": "REAL",
+            "alpha_180d": "REAL",
+        }
+        for col_name, col_type in new_columns.items():
+            if col_name not in existing:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE backtest_results ADD COLUMN {col_name} {col_type}")
+                    logger.debug(f"Added column backtest_results.{col_name}")
+                except Exception as e:
+                    logger.debug(f"Column {col_name} migration skipped: {e}")
+        conn.commit()
 
     @contextmanager
     def _conn(self):
         """Context manager for database connections."""
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        # WAL mode is set once in _init_db() and persists; only synchronous needs per-connection
         conn.execute("PRAGMA synchronous=NORMAL")
         try:
             yield conn
@@ -459,12 +484,22 @@ class SECDatabase:
     # BACKTEST RESULTS
     # ------------------------------------------------------------------
 
-    def save_backtest(self, ticker: str, filing_date: str, result: Dict):
+    def save_backtest(self, ticker: str, filing_date: str, result: Dict,
+                      signal_vector: Dict = None):
         with self._conn() as conn:
+            # benchmark_return is already stored inside the result JSON blob,
+            # so we don't duplicate it into the separate column
             conn.execute(
-                "INSERT OR REPLACE INTO backtest_results (ticker, filing_date, result, computed_at) "
-                "VALUES (?, ?, ?, ?)",
-                (ticker, filing_date, json.dumps(result), datetime.now().isoformat())
+                "INSERT OR REPLACE INTO backtest_results "
+                "(ticker, filing_date, result, computed_at, "
+                "signal_vector, alpha_30d, alpha_60d, alpha_90d, alpha_180d) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ticker, filing_date, json.dumps(result), datetime.now().isoformat(),
+                 json.dumps(signal_vector) if signal_vector else None,
+                 result.get("alpha_30d"),
+                 result.get("alpha_60d"),
+                 result.get("alpha_90d"),
+                 result.get("alpha_180d"))
             )
             conn.commit()
 
@@ -597,7 +632,7 @@ class SECDatabase:
         extra_fields = {k: v for k, v in filing.items() if k not in FILING_COLUMNS}
 
         conn.execute("""
-            INSERT OR REPLACE INTO filings
+            INSERT INTO filings
             (accession_number, ticker, company_name, cik, form_type, filing_date,
              filing_url, downloaded, local_path, download_retries,
              analyzed, llm_analyzed, tier2_analyzed,
@@ -608,6 +643,38 @@ class SECDatabase:
              result_file, tier1_result_file, tier2_result_file,
              analyzed_at, exchange, extra)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(accession_number) DO UPDATE SET
+                ticker = COALESCE(excluded.ticker, filings.ticker),
+                company_name = CASE WHEN excluded.company_name != '' THEN excluded.company_name ELSE filings.company_name END,
+                cik = CASE WHEN excluded.cik != '' THEN excluded.cik ELSE filings.cik END,
+                form_type = CASE WHEN excluded.form_type != '' THEN excluded.form_type ELSE filings.form_type END,
+                filing_date = CASE WHEN excluded.filing_date != '' THEN excluded.filing_date ELSE filings.filing_date END,
+                filing_url = CASE WHEN excluded.filing_url != '' THEN excluded.filing_url ELSE filings.filing_url END,
+                downloaded = CASE WHEN excluded.downloaded = 1 THEN 1 ELSE filings.downloaded END,
+                local_path = CASE WHEN excluded.local_path != '' THEN excluded.local_path ELSE filings.local_path END,
+                download_retries = COALESCE(excluded.download_retries, filings.download_retries),
+                analyzed = CASE WHEN excluded.analyzed = 1 THEN 1 ELSE filings.analyzed END,
+                llm_analyzed = CASE WHEN excluded.llm_analyzed = 1 THEN 1 ELSE filings.llm_analyzed END,
+                tier2_analyzed = CASE WHEN excluded.tier2_analyzed = 1 THEN 1 ELSE filings.tier2_analyzed END,
+                score = COALESCE(excluded.score, filings.score),
+                tier1_score = COALESCE(excluded.tier1_score, filings.tier1_score),
+                final_gem_score = COALESCE(excluded.final_gem_score, filings.final_gem_score),
+                gem_potential = COALESCE(excluded.gem_potential, filings.gem_potential),
+                conviction = COALESCE(excluded.conviction, filings.conviction),
+                recommendation = COALESCE(excluded.recommendation, filings.recommendation),
+                diff_signal = COALESCE(excluded.diff_signal, filings.diff_signal),
+                insider_signal = COALESCE(excluded.insider_signal, filings.insider_signal),
+                inflection_signal = COALESCE(excluded.inflection_signal, filings.inflection_signal),
+                composite_score = COALESCE(excluded.composite_score, filings.composite_score),
+                turnaround_score = COALESCE(excluded.turnaround_score, filings.turnaround_score),
+                research_signal_score = COALESCE(excluded.research_signal_score, filings.research_signal_score),
+                selected_for_tier2 = CASE WHEN excluded.selected_for_tier2 = 1 THEN 1 ELSE filings.selected_for_tier2 END,
+                result_file = CASE WHEN excluded.result_file != '' THEN excluded.result_file ELSE filings.result_file END,
+                tier1_result_file = CASE WHEN excluded.tier1_result_file != '' THEN excluded.tier1_result_file ELSE filings.tier1_result_file END,
+                tier2_result_file = CASE WHEN excluded.tier2_result_file != '' THEN excluded.tier2_result_file ELSE filings.tier2_result_file END,
+                analyzed_at = CASE WHEN excluded.analyzed_at != '' THEN excluded.analyzed_at ELSE filings.analyzed_at END,
+                exchange = CASE WHEN excluded.exchange != '' THEN excluded.exchange ELSE filings.exchange END,
+                extra = COALESCE(excluded.extra, filings.extra)
         """, (
             acc,
             filing.get('ticker', '').upper(),
@@ -652,11 +719,14 @@ class SECDatabase:
         for bk in ('downloaded', 'analyzed', 'llm_analyzed', 'tier2_analyzed', 'selected_for_tier2'):
             if bk in d:
                 d[bk] = bool(d[bk])
-        # Merge extra
+        # Merge extra, but don't overwrite existing column values
         extra = d.pop('extra', None)
         if extra:
             try:
-                d.update(json.loads(extra))
+                json_data = json.loads(extra)
+                # Only add keys that aren't already column names to avoid overwriting
+                json_data = {k: v for k, v in json_data.items() if k not in FILING_COLUMNS}
+                d.update(json_data)
             except (json.JSONDecodeError, TypeError):
                 pass
         return d
@@ -673,11 +743,14 @@ class SECDatabase:
                 d['scanned_form_types'] = json.loads(sft)
             except (json.JSONDecodeError, TypeError):
                 pass
-        # Merge extra
+        # Merge extra, but don't overwrite existing column values
         extra = d.pop('extra', None)
         if extra:
             try:
-                d.update(json.loads(extra))
+                json_data = json.loads(extra)
+                # Only add keys that aren't already column names to avoid overwriting
+                json_data = {k: v for k, v in json_data.items() if k not in UNIVERSE_COLUMNS}
+                d.update(json_data)
             except (json.JSONDecodeError, TypeError):
                 pass
         return d

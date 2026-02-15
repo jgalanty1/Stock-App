@@ -6,10 +6,10 @@ No Flask dependency. Called by cli.py.
 """
 
 import os
+import re
 import json
 import time
 import logging
-import traceback
 import threading
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Callable
@@ -36,8 +36,8 @@ def load_config() -> dict:
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
                 return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        pass
+    except (json.JSONDecodeError, IOError) as e:
+        logger.warning("config.json is corrupt, using defaults: %s", e)
     return {}
 
 
@@ -49,6 +49,12 @@ def save_config(cfg: dict):
         os.replace(tmp, CONFIG_FILE)
     except IOError as e:
         logger.error(f"Config save failed: {e}")
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def persist_key(env_var: str, value: str):
@@ -100,27 +106,35 @@ def get_key_status() -> Dict:
 # ============================================================================
 _scraper = None
 _db = None
+_init_lock = threading.Lock()
+
+# Module-level constants
+CALIBRATION_THRESHOLD = 15  # Minimum companies with returns to trigger calibration
 
 
 def get_scraper():
     global _scraper
     if _scraper is None:
-        from scraper import SECScraper
-        _scraper = SECScraper()
+        with _init_lock:
+            if _scraper is None:
+                from scraper import SECScraper
+                _scraper = SECScraper()
     return _scraper
 
 
 def get_db():
     global _db
     if _db is None:
-        try:
-            from database import SECDatabase
-            _db = SECDatabase(data_dir=os.environ.get("SEC_DATA_DIR", "sec_data"))
-            scraper = get_scraper()
-            if scraper.universe or scraper.filings_index:
-                _db.import_from_json(scraper.universe, scraper.filings_index)
-        except Exception as e:
-            logger.warning(f"SQLite init failed: {e}")
+        with _init_lock:
+            if _db is None:
+                try:
+                    from database import SECDatabase
+                    _db = SECDatabase(data_dir=os.environ.get("SEC_DATA_DIR", "sec_data"))
+                    scraper = get_scraper()
+                    if scraper.universe or scraper.filings_index:
+                        _db.import_from_json(scraper.universe, scraper.filings_index)
+                except Exception as e:
+                    logger.warning(f"SQLite init failed: {e}")
     return _db
 
 
@@ -129,8 +143,8 @@ def sync_db():
         db = get_db()
         if db:
             db.sync_from_scraper(get_scraper())
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("sync_db failed: %s", e)
 
 
 # ============================================================================
@@ -184,7 +198,7 @@ def run_pipeline(steps=None, min_market_cap=None, max_market_cap=None,
         if not fmp_key:
             raise RuntimeError("FMP_API_KEY not set. Run: python cli.py setup")
 
-        _progress('universe', f"Building universe (${int((min_market_cap or 20_000_000)/1e6)}-${int((max_market_cap or 100_000_000)/1e6)}M)...")
+        _progress('universe', f"Building universe (${round((min_market_cap or 20_000_000)/1e6)}-${round((max_market_cap or 100_000_000)/1e6)}M)...")
         count = scraper.step1_build_universe(
             fmp_api_key=fmp_key,
             progress_callback=lambda msg: _progress('universe', msg),
@@ -210,9 +224,17 @@ def run_pipeline(steps=None, min_market_cap=None, max_market_cap=None,
         _progress('download', f"Downloaded {count} filings")
 
     if 'insider' in steps or 'download' in steps:
+        # Only fetch insider data for companies that were actually scanned
+        scanned_tickers = None
+        if max_companies and scraper.universe:
+            scanned_tickers = {c.get('ticker', '') for c in scraper.universe[:max_companies]}
+            # Also include tickers from filings index (in case of prior runs)
+            scanned_tickers |= {f.get('ticker', '') for f in scraper.filings_index}
+            scanned_tickers.discard('')
         _progress('insider', "Fetching Form 4 insider data...")
         count = scraper.step4_fetch_insider_data(
             progress_callback=lambda c, t, tk, s: _progress('insider', f"{c}/{t} — {tk}", c, t),
+            company_tickers=scanned_tickers,
         )
         _progress('insider', f"Insider data for {count} companies")
 
@@ -235,17 +257,11 @@ def compute_company_potential_scores(scraper, tier1_results) -> List[Dict]:
     }
     try:
         from calibration import CalibrationEngine
-        engine = CalibrationEngine(scraper, [], data_dir=scraper.base_dir)
+        engine = CalibrationEngine(scraper, [], data_dir=scraper.data_dir)
         cal_weights = engine.get_current_weights()
         weights = cal_weights if cal_weights else _DEFAULT_WEIGHTS
     except Exception:
         weights = _DEFAULT_WEIGHTS
-
-    _ORIG_MAX = {
-        'catalyst_strength': 25, 'improvement_trajectory': 20,
-        'insider_conviction': 20, 'turnaround_indicators': 20,
-        'filing_recency': 15,
-    }
 
     t1_by_ticker = defaultdict(list)
     for r in tier1_results:
@@ -293,8 +309,8 @@ def compute_company_potential_scores(scraper, tier1_results) -> List[Dict]:
 
         # 3. Insider conviction (20 max)
         insider_pts = 5
-        ins = company.get('insider_data', {}) or {}
-        if ins and ins.get('signal') not in ('error', 'no_data', None, ''):
+        ins = company.get('insider_data') or {}
+        if ins and ins.get('signal') is not None and ins.get('signal') not in ('error', 'no_data', ''):
             acc_score = ins.get('accumulation_score', 50)
             insider_pts = max(0, min(15, round((acc_score - 30) * 15 / 70)))
             if ins.get('cluster_score', 0) >= 3:
@@ -315,7 +331,7 @@ def compute_company_potential_scores(scraper, tier1_results) -> List[Dict]:
         for fl in all_filings_by_ticker.get(ticker, []):
             ts = fl.get('turnaround_score')
             if ts is not None:
-                turnaround_pts = max(turnaround_pts, round(ts * 0.10))
+                turnaround_pts = max(turnaround_pts, min(20, round(ts * 0.10)))
             rs = fl.get('research_signal_score')
             if rs is not None and rs >= 65:
                 turnaround_pts = min(20, turnaround_pts + 3)
@@ -342,8 +358,8 @@ def compute_company_potential_scores(scraper, tier1_results) -> List[Dict]:
                 recency_pts = 4
             else:
                 recency_pts = 2
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed error: %s", e)
         filing_count = len(all_filings_by_ticker.get(ticker, []))
         if filing_count >= 4:
             recency_pts = min(15, recency_pts + 4)
@@ -367,7 +383,7 @@ def compute_company_potential_scores(scraper, tier1_results) -> List[Dict]:
         cps = 0
         weighted_components = {}
         for comp_name, raw_pts in raw_components.items():
-            orig_max = _ORIG_MAX.get(comp_name, 20)
+            orig_max = _DEFAULT_WEIGHTS.get(comp_name, 20)
             fraction = min(1.0, raw_pts / orig_max) if orig_max > 0 else 0
             w = weights.get(comp_name, _DEFAULT_WEIGHTS.get(comp_name, 15))
             weighted_pts = round(fraction * w, 1)
@@ -417,7 +433,340 @@ def compute_company_potential_scores(scraper, tier1_results) -> List[Dict]:
 # LLM ANALYSIS — TIER 1 + TIER 2
 # ============================================================================
 
+# Filing form type family constants (module-level for reuse)
+_PERIODIC = {'10-K', '10-Q'}
+_OWN_13D = {'SC 13D', 'SC 13D/A'}
+_OWN_13G = {'SC 13G', 'SC 13G/A'}
+
+
+def _same_family(ft1, ft2):
+    """Check if two filing form types belong to the same family."""
+    if ft1 in _PERIODIC and ft2 in _PERIODIC:
+        return True
+    if ft1 in _OWN_13D and ft2 in _OWN_13D:
+        return True
+    if ft1 in _OWN_13G and ft2 in _OWN_13G:
+        return True
+    return ft1 == ft2
+
+
+def _build_insider_signal_data(insider_result):
+    """Build insider signal data dict for research signal computation."""
+    if not insider_result:
+        return None
+    return {
+        'summary': {
+            'net_purchases': (insider_result.get('open_market_buys', 0) -
+                              insider_result.get('open_market_sells', 0)),
+            'buyer_count': insider_result.get('unique_buyers', 0),
+            'seller_count': insider_result.get('unique_sellers', 0),
+            'executive_buyers': 0,
+            'cluster_buy': insider_result.get('cluster_score', 0) >= 2,
+            'total_purchase_value': insider_result.get('total_buy_value', 0),
+        },
+    }
+
+
+def _build_cross_ref_context(ticker, current_acc, all_filings_by_ticker):
+    """Build cross-reference context string from other filings for the same ticker."""
+    cross_ref_context = ""
+    try:
+        other_filings = [f for f in all_filings_by_ticker.get(ticker, [])
+                         if f.get('accession_number') != current_acc
+                         and f.get('tier1_score') is not None]
+        if other_filings:
+            cross_ref_context = f"Other filings for {ticker}: "
+            for of in other_filings[:3]:
+                cross_ref_context += (
+                    f"{of.get('form_type','')} ({of.get('filing_date','')}): "
+                    f"T1 score={of.get('tier1_score','?')}, "
+                    f"gem={of.get('gem_potential','?')}; "
+                )
+    except Exception as e:
+        logger.debug("Suppressed error building cross-ref context: %s", e)
+    return cross_ref_context
+
+
+def _build_market_data_context(ticker, mkt, insider_result, t1_result):
+    """Build market data context strings from cached market data."""
+    peer_comparison = ""
+    short_interest = ""
+    insider_timing = ""
+    transcript_signals = ""
+    market_data_context = ""
+    try:
+        from market_data import (
+            is_short_squeeze_candidate, format_peer_comparison_for_prompt,
+            correlate_insider_timing,
+        )
+        if mkt.get('short_interest'):
+            si = mkt['short_interest']
+            short_interest = f"Short interest: {si.get('short_pct_float',0):.1f}% of float"
+            try:
+                sq = is_short_squeeze_candidate(si, insider_result or {}, t1_result.get('cps', 0))
+                if sq.get('is_candidate'):
+                    short_interest += f"\n⚠ SQUEEZE CANDIDATE (score {sq['score']})"
+            except Exception as e:
+                logger.debug("Suppressed error checking squeeze candidate: %s", e)
+        if mkt.get('peer_comparison'):
+            peer_comparison = format_peer_comparison_for_prompt(mkt['peer_comparison'])
+        if mkt.get('institutional'):
+            inst = mkt['institutional']
+            market_data_context = f"Institutional: {inst.get('signal', '?')}"
+        if insider_result:
+            try:
+                timing = correlate_insider_timing(insider_result, t1_result.get('filing_date', ''))
+                if timing.get('timing_signal') != 'neutral':
+                    insider_timing = f"Insider timing: {timing['timing_signal']} (score {timing['timing_score']})"
+            except Exception as e:
+                logger.debug("Suppressed error correlating insider timing: %s", e)
+        if mkt.get('transcript'):
+            tsigs = mkt['transcript']
+            transcript_signals = (
+                f"Earnings call: {tsigs.get('positive_count',0)} positive, "
+                f"{tsigs.get('negative_count',0)} negative"
+            )
+    except ImportError:
+        pass
+    return peer_comparison, short_interest, insider_timing, transcript_signals, market_data_context
+
+
+def _prefetch_one_ticker(ticker, ticker_to_cik, scraper_instance, edgar_session, edgar_limiter):
+    """Pre-fetch insider, XBRL, and market data for a single ticker."""
+    from insider_tracker import (
+        fetch_insider_transactions, fetch_institutional_filings,
+        analyze_insider_activity,
+    )
+    from inflection_detector import (
+        fetch_xbrl_financials, extract_financial_metrics, detect_inflections,
+    )
+
+    result = {'ticker': ticker, 'insider': None, 'xbrl': None, 'market': {}}
+    cik = ticker_to_cik.get(ticker, '')
+    cached_insider = scraper_instance.get_insider_for_ticker(ticker)
+    if cached_insider and cached_insider.get('signal') not in ('error', None):
+        result['insider'] = cached_insider
+    elif cik:
+        try:
+            txns = fetch_insider_transactions(cik, edgar_session, edgar_limiter)
+            inst_filings = fetch_institutional_filings(
+                cik, edgar_session, edgar_limiter, ticker=ticker,
+                company_name=next((c.get('company_name', '') for c in scraper_instance.universe
+                                   if c.get('ticker') == ticker), ''))
+            result['insider'] = analyze_insider_activity(txns, inst_filings)
+        except Exception as e:
+            logger.debug("Suppressed error fetching insider data: %s", e)
+    if cik:
+        try:
+            xbrl_facts = fetch_xbrl_financials(cik, edgar_session, edgar_limiter)
+            if xbrl_facts:
+                metrics = extract_financial_metrics(xbrl_facts)
+                result['xbrl'] = detect_inflections(metrics)
+        except Exception as e:
+            logger.debug("Suppressed error fetching XBRL data: %s", e)
+    try:
+        from market_data import (
+            fetch_short_interest, compute_peer_comparison,
+            fetch_institutional_holders, analyze_institutional_changes,
+            fetch_latest_transcript, extract_transcript_signals,
+        )
+        mkt = {}
+        try:
+            si = fetch_short_interest(ticker)
+            if si:
+                mkt['short_interest'] = si
+        except Exception as e:
+            logger.debug("Suppressed error fetching short interest: %s", e)
+        try:
+            peers = compute_peer_comparison(ticker)
+            if peers:
+                mkt['peer_comparison'] = peers
+        except Exception as e:
+            logger.debug("Suppressed error computing peer comparison: %s", e)
+        try:
+            holders = fetch_institutional_holders(ticker)
+            if holders:
+                mkt['institutional'] = analyze_institutional_changes(holders)
+        except Exception as e:
+            logger.debug("Suppressed error fetching institutional holders: %s", e)
+        try:
+            transcript = fetch_latest_transcript(ticker)
+            if transcript and transcript.get('content'):
+                mkt['transcript'] = extract_transcript_signals(transcript)
+        except Exception as e:
+            logger.debug("Suppressed error extracting transcript signals: %s", e)
+        result['market'] = mkt
+    except ImportError:
+        pass
+    return result
+
+
+def _save_t2_result_to_index(t2_result, ctx, scraper_instance, lock=None):
+    """
+    Save a Tier 2 result to the results folder and update the filings index.
+
+    Extracted from run_analysis() inner function to allow reuse by import_analysis_results().
+
+    Args:
+        t2_result: The LLM T2 analysis output dict
+        ctx: Context dict with keys: ticker, t1_result, diff_data, prior_filing_info,
+             insider_result, inflection_result, research_signals_result,
+             catalyst_result, current_forensics
+        scraper_instance: The SECScraper instance to update and save state
+        lock: Optional threading.Lock for thread-safe updates
+    """
+    tk = ctx['ticker']
+    t1_result = ctx['t1_result']
+    diff_data = ctx.get('diff_data')
+    insider_result = ctx.get('insider_result')
+    inflection_result = ctx.get('inflection_result')
+    research_signals_result = ctx.get('research_signals_result')
+    catalyst_result = ctx.get('catalyst_result')
+    current_forensics = ctx.get('current_forensics')
+    amendment_result = ctx.get('amendment_result')
+    concentration_result = ctx.get('concentration_result')
+
+    if not t2_result:
+        return False
+
+    t2_result['tier1_score'] = t1_result.get('composite_score')
+    t2_result['accession_number'] = t1_result.get('accession_number')
+    t2_result['filing_date'] = t1_result.get('filing_date')
+    if current_forensics:
+        t2_result['forensics'] = current_forensics
+    if diff_data and 'error' not in (diff_data or {}):
+        prior_filing_info = ctx.get('prior_filing_info') or {}
+        t2_result['filing_diff'] = {
+            'prior_filing_date': prior_filing_info.get('filing_date', ''),
+            'overall_signal': diff_data.get('overall_signal', ''),
+            'positive_shifts': diff_data.get('positive_shifts', 0),
+            'negative_shifts': diff_data.get('negative_shifts', 0),
+        }
+    if insider_result:
+        t2_result['insider_activity'] = {
+            'accumulation_score': insider_result.get('accumulation_score', 50),
+            'signal': insider_result.get('signal', 'no_data'),
+            'unique_buyers': insider_result.get('unique_buyers', 0),
+            'cluster_score': insider_result.get('cluster_score', 0),
+            'has_activist_holder': insider_result.get('has_activist_holder', False),
+        }
+    if inflection_result:
+        t2_result['financial_inflections'] = {
+            'inflection_score': inflection_result.get('inflection_score', 50),
+            'signal': inflection_result.get('signal', 'neutral'),
+        }
+    if research_signals_result:
+        t2_result['research_signals'] = {
+            'research_signal_score': research_signals_result.get('research_signal_score', 50),
+            'research_signal': research_signals_result.get('research_signal', 'neutral'),
+        }
+    if catalyst_result:
+        t2_result['turnaround_catalysts'] = {
+            'turnaround_score': catalyst_result.get('turnaround_score', 50),
+            'turnaround_signal': catalyst_result.get('turnaround_signal', ''),
+            'turnaround_phase': catalyst_result.get('turnaround_phase', ''),
+        }
+    if amendment_result:
+        t2_result['amendment_detection'] = amendment_result
+    if concentration_result:
+        t2_result['revenue_concentration'] = concentration_result
+
+    def _do_update():
+        safe_tk = re.sub(r'[^\w.-]', '_', tk)
+        result_filename = f"{safe_tk}_tier2_{t1_result.get('filing_date', '')}.json"
+        result_path = os.path.join(RESULTS_FOLDER, result_filename)
+        tmp_path = result_path + '.tmp'
+        with open(tmp_path, 'w') as rf:
+            json.dump(t2_result, rf, indent=2)
+        os.replace(tmp_path, result_path)
+        for f in scraper_instance.filings_index:
+            if f.get('accession_number') == t1_result.get('accession_number'):
+                f['tier2_analyzed'] = True
+                raw_score = t2_result.get('final_gem_score')
+                try:
+                    f['final_gem_score'] = int(float(raw_score)) if raw_score is not None else None
+                except (ValueError, TypeError):
+                    f['final_gem_score'] = None
+                f['conviction'] = t2_result.get('conviction_level')
+                f['recommendation'] = t2_result.get('recommendation')
+                f['tier2_result_file'] = result_filename
+                f['has_prior_diff'] = diff_data is not None and 'error' not in (diff_data or {})
+                f['diff_signal'] = diff_data.get('overall_signal', '') if diff_data else ''
+                f['insider_signal'] = insider_result.get('signal', '') if insider_result else ''
+                f['accumulation_score'] = insider_result.get('accumulation_score', 50) if insider_result else None
+                f['inflection_signal'] = inflection_result.get('signal', '') if inflection_result else ''
+                f['inflection_score'] = inflection_result.get('inflection_score', 50) if inflection_result else None
+                f['research_signal_score'] = research_signals_result.get('research_signal_score', 50) if research_signals_result else None
+                f['research_signal'] = research_signals_result.get('research_signal', '') if research_signals_result else ''
+                f['turnaround_score'] = catalyst_result.get('turnaround_score', 50) if catalyst_result else None
+                f['turnaround_signal'] = catalyst_result.get('turnaround_signal', '') if catalyst_result else ''
+                f['turnaround_phase'] = catalyst_result.get('turnaround_phase', '') if catalyst_result else ''
+
+                # Record baseline price for survivor bias tracking
+                try:
+                    from market_data import get_price_at_date, fetch_price_history
+                    _fdate = t1_result.get('filing_date', '')
+                    if _fdate:
+                        _hist = fetch_price_history(tk, 60)
+                        _base = get_price_at_date(tk, _fdate, _hist)
+                        if _base:
+                            f['baseline_price'] = _base
+                            f['baseline_price_date'] = _fdate
+                except Exception as e:
+                    logger.debug("Suppressed error: %s", e)
+
+                # Extract T2 sub-scores for signal-level backtesting
+                deep = t2_result.get('deep_analysis', {})
+                if deep:
+                    f['mgmt_authenticity_score'] = deep.get('management_authenticity', {}).get('score')
+                    f['competitive_position_score'] = deep.get('competitive_position', {}).get('score')
+                    f['capital_allocation_score'] = deep.get('capital_allocation', {}).get('score')
+                ta = t2_result.get('turnaround_assessment', {})
+                if ta:
+                    f['turnaround_conviction'] = ta.get('overall_turnaround_conviction', '')
+                    f['catalyst_stacking_count'] = ta.get('catalyst_stacking_count', 0)
+                ft = t2_result.get('financial_trajectory', {})
+                if ft:
+                    f['revenue_momentum'] = ft.get('revenue_momentum', '')
+                    f['profitability_trajectory'] = ft.get('profitability_trajectory', '')
+                    f['dilution_risk'] = ft.get('dilution_risk', '')
+
+                # Index Opus deep signals for backtesting
+                opus_deep = t2_result.get('opus_deep_signals', {})
+                if opus_deep:
+                    f['has_contrarian_thesis'] = bool(opus_deep.get('contrarian_thesis', {}).get('contrarian_view'))
+                    f['asymmetry_level'] = opus_deep.get('information_asymmetry', {}).get('asymmetry_level', '')
+                    f['narrative_contradictions'] = len(opus_deep.get('narrative_vs_numbers', {}).get('contradicted_claims', []))
+                    f['non_obvious_catalyst_count'] = len(opus_deep.get('non_obvious_catalysts', []))
+
+                # Amendment & restatement detection
+                amend = t2_result.get('amendment_detection', {})
+                if amend:
+                    f['has_amendment'] = amend.get('is_amendment', False)
+                    f['has_restatement'] = amend.get('has_restatement', False)
+                    f['amendment_score'] = amend.get('amendment_score', 50)
+
+                # Revenue concentration
+                conc = t2_result.get('revenue_concentration', {})
+                if conc:
+                    f['revenue_concentration_score'] = conc.get('concentration_score', 0)
+
+                break
+
+    if lock:
+        with lock:
+            _do_update()
+    else:
+        _do_update()
+
+    # Save state outside the lock to avoid holding it during I/O
+    scraper_instance._save_state()
+
+    return True
+
+
 # Shared progress state for CLI display
+_status_lock = threading.Lock()
 analysis_status = {
     "running": False,
     "tier": 0,
@@ -465,7 +814,8 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
     }
 
     def _progress(msg):
-        analysis_status["message"] = msg
+        with _status_lock:
+            analysis_status["message"] = msg
         if progress_fn:
             progress_fn(analysis_status)
         else:
@@ -482,12 +832,13 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
 
     if not filings_to_analyze:
         _progress("No filings to analyze")
-        analysis_status["running"] = False
+        with _status_lock:
+            analysis_status["running"] = False
         return analysis_status
 
     # Resolve T2 model config
-    t2_model_name = tier2_model or "claude-haiku-4-5-20251001"
-    thinking_budget = None
+    t2_model_name = tier2_model or "claude-haiku"
+    thinking_budget = 0
     if effort == 'high':
         thinking_budget = 10000
     elif effort == 'medium':
@@ -497,7 +848,8 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
     # TIER 1 — PARALLEL
     # ================================================================
     total = len(filings_to_analyze)
-    analysis_status["total"] = total
+    with _status_lock:
+        analysis_status["total"] = total
     _progress(f"Tier 1: analyzing {total} filings [{tier1_workers}x parallel]...")
 
     _t1_lock = threading.Lock()
@@ -547,12 +899,16 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
                 if result:
                     tier1_results.append(result)
                     analysis_status["completed_tier1"] += 1
+                    # Cost estimate: ~80K input + ~2K output tokens at gpt-4o-mini rates
+                    # See llm_analysis.MODELS for current pricing
                     analysis_status["estimated_cost_usd"] += round(
                         80000 * 0.15 / 1_000_000 + 2000 * 0.60 / 1_000_000, 4)
                     result_filename = f"{ticker}_tier1_{filing.get('filing_date', '')}.json"
                     result_path = os.path.join(RESULTS_FOLDER, result_filename)
-                    with open(result_path, 'w') as rf:
+                    tmp_path = result_path + '.tmp'
+                    with open(tmp_path, 'w') as rf:
                         json.dump(result, rf, indent=2)
+                    os.replace(tmp_path, result_path)
                     filing['llm_analyzed'] = True
                     filing['tier1_score'] = result.get('composite_score')
                     filing['gem_potential'] = result.get('gem_potential')
@@ -577,9 +933,11 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
     # CPS + TIER 2 SELECTION
     # ================================================================
     if not tier1_results:
-        analysis_status["tier"] = 2
+        with _status_lock:
+            analysis_status["tier"] = 2
         _progress("Tier 1 produced 0 results — skipping Tier 2")
-        analysis_status["running"] = False
+        with _status_lock:
+            analysis_status["running"] = False
         return analysis_status
 
     # Include previously analyzed T1 results
@@ -603,7 +961,6 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
 
     # Select top companies by CPS percentile
     company_count = max(1, int(len(company_scores) * tier2_pct))
-    top_companies = set(c['ticker'] for c in company_scores[:company_count])
     _progress(f"Tier 2 selecting top {company_count} of {len(company_scores)} companies")
 
     # Build T2 candidates: ALL filings from selected companies
@@ -628,9 +985,10 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
     # ================================================================
     # TIER 2 — PRE-FETCH + PARALLEL LLM
     # ================================================================
-    analysis_status["tier"] = 2
-    analysis_status["total"] = len(tier2_candidates)
-    analysis_status["progress"] = 0
+    with _status_lock:
+        analysis_status["tier"] = 2
+        analysis_status["total"] = len(tier2_candidates)
+        analysis_status["progress"] = 0
 
     # Build lookups
     ticker_to_cik = {c.get('ticker', ''): c.get('cik', '') for c in scraper.universe if c.get('ticker')}
@@ -642,6 +1000,8 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
     for t in all_filings_by_ticker:
         all_filings_by_ticker[t].sort(key=lambda x: x.get('filing_date', ''), reverse=True)
 
+    # NOTE: requests.Session is not fully thread-safe for concurrent requests.
+    # However, the EDGAR rate limiter serializes access sufficiently in practice.
     edgar_session = _get_session()
     _insider_cache = {}
     _xbrl_cache = {}
@@ -651,70 +1011,10 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
     unique_tickers = list(set(t.get('ticker', '') for t in tier2_candidates if t.get('ticker')))
     _progress(f"Pre-fetching EDGAR + market data for {len(unique_tickers)} tickers...")
 
-    def _prefetch_ticker_data(ticker):
-        result = {'ticker': ticker, 'insider': None, 'xbrl': None, 'market': {}}
-        cik = ticker_to_cik.get(ticker, '')
-        cached_insider = scraper.get_insider_for_ticker(ticker)
-        if cached_insider and cached_insider.get('signal') not in ('error', None):
-            result['insider'] = cached_insider
-        elif cik:
-            try:
-                txns = fetch_insider_transactions(cik, edgar_session, _edgar_limiter)
-                inst_filings = fetch_institutional_filings(
-                    cik, edgar_session, _edgar_limiter, ticker=ticker,
-                    company_name=next((c.get('company_name', '') for c in scraper.universe
-                                       if c.get('ticker') == ticker), ''))
-                result['insider'] = analyze_insider_activity(txns, inst_filings)
-            except Exception:
-                pass
-        if cik:
-            try:
-                xbrl_facts = fetch_xbrl_financials(cik, edgar_session, _edgar_limiter)
-                if xbrl_facts:
-                    metrics = extract_financial_metrics(xbrl_facts)
-                    result['xbrl'] = detect_inflections(metrics)
-            except Exception:
-                pass
-        try:
-            from market_data import (
-                fetch_short_interest, compute_peer_comparison,
-                fetch_institutional_holders, analyze_institutional_changes,
-                fetch_latest_transcript, extract_transcript_signals,
-            )
-            mkt = {}
-            try:
-                si = fetch_short_interest(ticker)
-                if si:
-                    mkt['short_interest'] = si
-            except Exception:
-                pass
-            try:
-                peers = compute_peer_comparison(ticker)
-                if peers:
-                    mkt['peer_comparison'] = peers
-            except Exception:
-                pass
-            try:
-                holders = fetch_institutional_holders(ticker)
-                if holders:
-                    mkt['institutional'] = analyze_institutional_changes(holders)
-            except Exception:
-                pass
-            try:
-                transcript = fetch_latest_transcript(ticker)
-                if transcript and transcript.get('content'):
-                    mkt['transcript'] = extract_transcript_signals(transcript)
-            except Exception:
-                pass
-            result['market'] = mkt
-        except ImportError:
-            pass
-        return result
-
     PREFETCH_WORKERS = min(6, len(unique_tickers))
     prefetch_done = 0
     with ThreadPoolExecutor(max_workers=PREFETCH_WORKERS) as pf_executor:
-        pf_futures = {pf_executor.submit(_prefetch_ticker_data, tk): tk for tk in unique_tickers}
+        pf_futures = {pf_executor.submit(_prefetch_one_ticker, tk, ticker_to_cik, scraper, edgar_session, _edgar_limiter): tk for tk in unique_tickers}
         for fut in as_completed(pf_futures):
             try:
                 pf_result = fut.result()
@@ -724,103 +1024,29 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
                 if pf_result['xbrl']:
                     _xbrl_cache[tk] = pf_result['xbrl']
                 _market_cache[tk] = pf_result.get('market', {})
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed error: %s", e)
             prefetch_done += 1
             _progress(f"Pre-fetch: {prefetch_done}/{len(unique_tickers)} tickers [{PREFETCH_WORKERS}x]")
 
     # --- T2 PARALLEL LLM ---
     _t2_lock = threading.Lock()
     _t2_start_time = time.time()
-    _t2_filing_times = []
     TIER2_WORKERS = max(1, min(tier2_workers, len(tier2_candidates)))
     _pending_t2 = []
 
     def _save_t2_result(t2_result, ctx):
         tk = ctx['ticker']
-        t1_result = ctx['t1_result']
-        diff_data = ctx.get('diff_data')
-        insider_result = ctx.get('insider_result')
-        inflection_result = ctx.get('inflection_result')
-        research_signals_result = ctx.get('research_signals_result')
-        catalyst_result = ctx.get('catalyst_result')
-        current_forensics = ctx.get('current_forensics')
         _filing_start = ctx.get('filing_start', time.time())
 
         if t2_result:
-            t2_result['tier1_score'] = t1_result.get('composite_score')
-            t2_result['accession_number'] = t1_result.get('accession_number')
-            t2_result['filing_date'] = t1_result.get('filing_date')
-            if current_forensics:
-                t2_result['forensics'] = current_forensics
-            if diff_data and 'error' not in (diff_data or {}):
-                prior_filing_info = ctx.get('prior_filing_info') or {}
-                t2_result['filing_diff'] = {
-                    'prior_filing_date': prior_filing_info.get('filing_date', ''),
-                    'overall_signal': diff_data.get('overall_signal', ''),
-                    'positive_shifts': diff_data.get('positive_shifts', 0),
-                    'negative_shifts': diff_data.get('negative_shifts', 0),
-                }
-            if insider_result:
-                t2_result['insider_activity'] = {
-                    'accumulation_score': insider_result.get('accumulation_score', 50),
-                    'signal': insider_result.get('signal', 'no_data'),
-                    'unique_buyers': insider_result.get('unique_buyers', 0),
-                    'cluster_score': insider_result.get('cluster_score', 0),
-                    'has_activist_holder': insider_result.get('has_activist_holder', False),
-                }
-            if inflection_result:
-                t2_result['financial_inflections'] = {
-                    'inflection_score': inflection_result.get('inflection_score', 50),
-                    'signal': inflection_result.get('signal', 'neutral'),
-                }
-            if research_signals_result:
-                t2_result['research_signals'] = {
-                    'research_signal_score': research_signals_result.get('research_signal_score', 50),
-                    'research_signal': research_signals_result.get('research_signal', 'neutral'),
-                }
-            if catalyst_result:
-                t2_result['turnaround_catalysts'] = {
-                    'turnaround_score': catalyst_result.get('turnaround_score', 50),
-                    'turnaround_signal': catalyst_result.get('turnaround_signal', ''),
-                    'turnaround_phase': catalyst_result.get('turnaround_phase', ''),
-                }
-
+            _save_t2_result_to_index(t2_result, ctx, scraper, lock=_t2_lock)
             with _t2_lock:
                 analysis_status["completed_tier2"] += 1
+                # Cost estimate: ~200K input + ~4K output tokens at claude-sonnet rates
+                # See llm_analysis.MODELS for current pricing
                 analysis_status["estimated_cost_usd"] += round(
                     200000 * 3.0 / 1_000_000 + 4000 * 15.0 / 1_000_000, 4)
-                result_filename = f"{tk}_tier2_{t1_result.get('filing_date', '')}.json"
-                result_path = os.path.join(RESULTS_FOLDER, result_filename)
-                with open(result_path, 'w') as rf:
-                    json.dump(t2_result, rf, indent=2)
-                for f in scraper.filings_index:
-                    if f.get('accession_number') == t1_result.get('accession_number'):
-                        f['tier2_analyzed'] = True
-                        raw_score = t2_result.get('final_gem_score')
-                        try:
-                            f['final_gem_score'] = int(float(raw_score)) if raw_score is not None else None
-                        except (ValueError, TypeError):
-                            f['final_gem_score'] = None
-                        f['conviction'] = t2_result.get('conviction_level')
-                        f['recommendation'] = t2_result.get('recommendation')
-                        f['tier2_result_file'] = result_filename
-                        f['has_prior_diff'] = diff_data is not None and 'error' not in (diff_data or {})
-                        f['diff_signal'] = diff_data.get('overall_signal', '') if diff_data else ''
-                        f['insider_signal'] = insider_result.get('signal', '') if insider_result else ''
-                        f['accumulation_score'] = insider_result.get('accumulation_score', 50) if insider_result else None
-                        f['inflection_signal'] = inflection_result.get('signal', '') if inflection_result else ''
-                        f['inflection_score'] = inflection_result.get('inflection_score', 50) if inflection_result else None
-                        f['research_signal_score'] = research_signals_result.get('research_signal_score', 50) if research_signals_result else None
-                        f['research_signal'] = research_signals_result.get('research_signal', '') if research_signals_result else ''
-                        f['turnaround_score'] = catalyst_result.get('turnaround_score', 50) if catalyst_result else None
-                        f['turnaround_signal'] = catalyst_result.get('turnaround_signal', '') if catalyst_result else ''
-                        f['turnaround_phase'] = catalyst_result.get('turnaround_phase', '') if catalyst_result else ''
-                        break
-                scraper._save_state()
-                analysis_status["tier2_last_completed"] = tk
-                _filing_elapsed = time.time() - _filing_start
-                _t2_filing_times.append(_filing_elapsed)
         else:
             with _t2_lock:
                 analysis_status["failed_tier2"] += 1
@@ -842,9 +1068,9 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
                 still_pending.append((fut, ctx))
         _pending_t2 = still_pending
 
-    t2_executor = ThreadPoolExecutor(max_workers=TIER2_WORKERS)
     _progress(f"Tier 2: {len(tier2_candidates)} filings [{TIER2_WORKERS}x parallel LLM]...")
 
+    t2_executor = ThreadPoolExecutor(max_workers=TIER2_WORKERS)
     for i, t1_result in enumerate(tier2_candidates):
         ticker = t1_result.get('ticker', 'UNKNOWN')
 
@@ -853,15 +1079,18 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
             acc = t1_result.get('accession_number', '')
             if any(f.get('accession_number') == acc and f.get('tier2_analyzed')
                    for f in scraper.filings_index):
-                analysis_status["progress"] = i + 1
+                with _status_lock:
+                    analysis_status["progress"] = i + 1
                 continue
 
-        analysis_status["progress"] = i + 1
+        with _status_lock:
+            analysis_status["progress"] = i + 1
         _filing_start = time.time()
 
         filepath = t1_result.get('local_path', '')
         if not filepath or not os.path.exists(filepath):
-            analysis_status["failed_tier2"] += 1
+            with _status_lock:
+                analysis_status["failed_tier2"] += 1
             continue
 
         try:
@@ -878,15 +1107,6 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
             prior_filing_info = None
             current_form = t1_result.get('form_type', '')
             current_acc = t1_result.get('accession_number', '')
-            _PERIODIC = {'10-K', '10-Q'}
-            _OWN_13D = {'SC 13D', 'SC 13D/A'}
-            _OWN_13G = {'SC 13G', 'SC 13G/A'}
-
-            def _same_family(ft1, ft2):
-                if ft1 in _PERIODIC and ft2 in _PERIODIC: return True
-                if ft1 in _OWN_13D and ft2 in _OWN_13D: return True
-                if ft1 in _OWN_13G and ft2 in _OWN_13G: return True
-                return ft1 == ft2
 
             for pf in all_filings_by_ticker.get(ticker, []):
                 pf_acc = pf.get('accession_number', '')
@@ -904,15 +1124,15 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
             if prior_filing_info:
                 try:
                     pf_path = prior_filing_info['local_path']
-                    with open(pf_path, 'r', encoding='utf-8', errors='ignore') as pf:
-                        prior_content = pf.read()
+                    with open(pf_path, 'r', encoding='utf-8', errors='ignore') as fh:
+                        prior_content = fh.read()
                     if pf_path.endswith('.html') or pf_path.endswith('.htm'):
                         prior_content = extract_text_from_html(prior_content)
                     prior_text = prior_content
                     prior_forensics = analyze_language(prior_content)
                     diff_data = diff_filings(prior_forensics, current_forensics)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Suppressed error: %s", e)
 
             forensic_prompt = format_forensics_for_prompt(current_forensics, diff_data)
 
@@ -932,34 +1152,32 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
                     filing_timing = analyze_filing_timing(
                         t1_result.get('filing_date', ''), t1_result.get('form_type', '10-K'))
                     inflection_prompt = format_inflection_for_prompt(inflection_result, filing_timing)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Suppressed error: %s", e)
 
             # Research signals
             research_signals_prompt = ""
             research_signals_result = None
             try:
                 from filing_signals import compute_all_signals, format_signals_for_prompt
-                insider_signal_data = None
-                if insider_result:
-                    insider_signal_data = {
-                        'summary': {
-                            'net_purchases': (insider_result.get('open_market_buys', 0) -
-                                              insider_result.get('open_market_sells', 0)),
-                            'buyer_count': insider_result.get('unique_buyers', 0),
-                            'seller_count': insider_result.get('unique_sellers', 0),
-                            'executive_buyers': 0,
-                            'cluster_buy': insider_result.get('cluster_score', 0) >= 2,
-                            'total_purchase_value': insider_result.get('total_buy_value', 0),
-                        },
-                    }
+                insider_signal_data = _build_insider_signal_data(insider_result)
                 sigs = compute_all_signals(content, prior_text, insider_signal_data,
                                            t1_result.get('filing_date', ''),
                                            t1_result.get('form_type', '10-K'))
                 research_signals_result = sigs
                 research_signals_prompt = format_signals_for_prompt(sigs)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed error: %s", e)
+
+            # Amendment & restatement detection + revenue concentration
+            amendment_result = None
+            concentration_result = None
+            try:
+                from filing_signals import detect_amendment_restatement, detect_revenue_concentration
+                amendment_result = detect_amendment_restatement(content, t1_result.get('form_type', ''))
+                concentration_result = detect_revenue_concentration(content)
+            except Exception as e:
+                logger.debug("Suppressed error: %s", e)
 
             # Catalysts
             catalyst_prompt = ""
@@ -968,67 +1186,16 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
                 from catalyst_extractor import extract_catalysts, format_catalysts_for_prompt
                 catalyst_result = extract_catalysts(content, t1_result.get('form_type', '10-K'))
                 catalyst_prompt = format_catalysts_for_prompt(catalyst_result)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed error: %s", e)
 
             # Cross-reference context
-            cross_ref_context = ""
-            try:
-                other_filings = [f for f in all_filings_by_ticker.get(ticker, [])
-                                 if f.get('accession_number') != current_acc
-                                 and f.get('tier1_score') is not None]
-                if other_filings:
-                    cross_ref_context = f"Other filings for {ticker}: "
-                    for of in other_filings[:3]:
-                        cross_ref_context += (
-                            f"{of.get('form_type','')} ({of.get('filing_date','')}): "
-                            f"T1 score={of.get('tier1_score','?')}, "
-                            f"gem={of.get('gem_potential','?')}; "
-                        )
-            except Exception:
-                pass
+            cross_ref_context = _build_cross_ref_context(ticker, current_acc, all_filings_by_ticker)
 
             # Market data (from cache)
-            peer_comparison = ""
-            short_interest = ""
-            insider_timing = ""
-            transcript_signals = ""
-            market_data_context = ""
             mkt = _market_cache.get(ticker, {})
-            try:
-                from market_data import (
-                    is_short_squeeze_candidate, format_peer_comparison_for_prompt,
-                    correlate_insider_timing,
-                )
-                if mkt.get('short_interest'):
-                    si = mkt['short_interest']
-                    short_interest = f"Short interest: {si.get('short_pct_float',0):.1f}% of float"
-                    try:
-                        sq = is_short_squeeze_candidate(si, insider_result or {}, t1_result.get('cps', 0))
-                        if sq.get('is_candidate'):
-                            short_interest += f"\n⚠ SQUEEZE CANDIDATE (score {sq['score']})"
-                    except Exception:
-                        pass
-                if mkt.get('peer_comparison'):
-                    peer_comparison = format_peer_comparison_for_prompt(mkt['peer_comparison'])
-                if mkt.get('institutional'):
-                    inst = mkt['institutional']
-                    market_data_context = f"Institutional: {inst.get('signal', '?')}"
-                if insider_result:
-                    try:
-                        timing = correlate_insider_timing(insider_result, t1_result.get('filing_date', ''))
-                        if timing.get('timing_signal') != 'neutral':
-                            insider_timing = f"Insider timing: {timing['timing_signal']} (score {timing['timing_score']})"
-                    except Exception:
-                        pass
-                if mkt.get('transcript'):
-                    tsigs = mkt['transcript']
-                    transcript_signals = (
-                        f"Earnings call: {tsigs.get('positive_count',0)} positive, "
-                        f"{tsigs.get('negative_count',0)} negative"
-                    )
-            except ImportError:
-                pass
+            peer_comparison, short_interest, insider_timing, transcript_signals, market_data_context = \
+                _build_market_data_context(ticker, mkt, insider_result, t1_result)
 
             # Submit LLM call to thread pool
             _t2_ctx = {
@@ -1038,6 +1205,8 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
                 'research_signals_result': research_signals_result,
                 'catalyst_result': catalyst_result,
                 'current_forensics': current_forensics,
+                'amendment_result': amendment_result,
+                'concentration_result': concentration_result,
                 'filing_start': _filing_start,
             }
             _t2_future = t2_executor.submit(
@@ -1069,15 +1238,17 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
             _progress(f"Tier 2: {i+1}/{len(tier2_candidates)} — {ticker} (✅{ok} ❌{fail}) [{TIER2_WORKERS}x]")
 
         except Exception as e:
-            analysis_status["failed_tier2"] += 1
-            analysis_status["errors"].append(f"{ticker} T2: {type(e).__name__}: {str(e)[:200]}")
+            with _status_lock:
+                analysis_status["failed_tier2"] += 1
+                analysis_status["errors"].append(f"{ticker} T2: {type(e).__name__}: {str(e)[:200]}")
 
     # Drain remaining
-    if _pending_t2:
-        _progress(f"Tier 2: waiting for {len(_pending_t2)} remaining LLM calls...")
-        _drain_t2_futures(wait_all=True)
-
-    t2_executor.shutdown(wait=True)
+    try:
+        if _pending_t2:
+            _progress(f"Tier 2: waiting for {len(_pending_t2)} remaining LLM calls...")
+            _drain_t2_futures(wait_all=True)
+    finally:
+        t2_executor.shutdown(wait=True)
     scraper._save_state()
     sync_db()
 
@@ -1089,8 +1260,836 @@ def run_analysis(tier2_pct=0.25, reanalyze=False, tier2_model='',
         f"T2: {analysis_status['completed_tier2']} OK / "
         f"{analysis_status['failed_tier2']} failed — ⏱ {elapsed_str}"
     )
-    analysis_status["running"] = False
+    # Auto-collect outcomes after analysis completes (Phase 1H)
+    try:
+        outcome_summary = auto_collect_outcomes(include_t1=True)
+        logger.info(f"Outcomes: {outcome_summary.get('collected', 0)} filings tracked")
+    except Exception as e:
+        logger.warning(f"Auto outcome collection failed: {e}")
+
+    with _status_lock:
+        analysis_status["running"] = False
     return analysis_status
+
+
+# ============================================================================
+# LOCAL ANALYSIS: PREPARE BUNDLES
+# ============================================================================
+PREPARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prepared')
+
+
+def prepare_analysis(tier='auto', tier2_pct=0.25, reanalyze=False,
+                     progress_fn=None) -> Dict:
+    """
+    Prepare analysis bundles for local Claude Code analysis (no LLM API calls).
+
+    Creates prepared/ directory with T1 and/or T2 bundles containing all context
+    needed for analysis, plus pre-truncated filing text files.
+
+    Args:
+        tier: 'auto', '1', or '2' — which tier to prepare
+        tier2_pct: Top % of companies for T2 (default 0.25)
+        reanalyze: Re-prepare already-processed filings
+        progress_fn: Callback for progress updates
+
+    Returns:
+        Dict with manifest info and counts
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from scraper import extract_text_from_html, get_cached_text, _get_session, _edgar_limiter
+    from llm_analysis import (
+        SYSTEM_PROMPT_GEM_FINDER, SYSTEM_PROMPT_DEEP_ANALYSIS,
+        TIER1_SCREENING_PROMPT, TIER1_OWNERSHIP_PROMPT,
+        TIER1_8K_EVENT_PROMPT, TIER1_DEF14A_PROMPT,
+        OPUS_DEEP_ANALYSIS_INSTRUCTIONS, _truncate_text,
+    )
+    from forensics import analyze_language, format_forensics_for_prompt, diff_filings
+    from insider_tracker import (
+        fetch_insider_transactions, fetch_institutional_filings,
+        analyze_insider_activity, format_insider_for_prompt,
+    )
+    from inflection_detector import (
+        fetch_xbrl_financials, extract_financial_metrics,
+        detect_inflections, analyze_filing_timing, format_inflection_for_prompt,
+    )
+
+    scraper = get_scraper()
+
+    def _progress(msg):
+        if progress_fn:
+            progress_fn(msg)
+        else:
+            logger.info(msg)
+
+    # Create directory structure
+    for subdir in ['t1', 't2', 'texts', 't1_results', 't2_results']:
+        os.makedirs(os.path.join(PREPARED_DIR, subdir), exist_ok=True)
+
+    # Auto-detect what to prepare
+    prepare_t1 = False
+    prepare_t2 = False
+
+    if tier == '1':
+        prepare_t1 = True
+    elif tier == '2':
+        prepare_t2 = True
+    else:
+        # Auto: check what needs doing
+        unanalyzed = [f for f in scraper.filings_index
+                      if f.get('downloaded') and not f.get('llm_analyzed')]
+        t1_done_no_t2 = [f for f in scraper.filings_index
+                         if f.get('llm_analyzed') and f.get('tier1_score') is not None
+                         and not f.get('tier2_analyzed')]
+        if unanalyzed:
+            prepare_t1 = True
+        if t1_done_no_t2:
+            prepare_t2 = True
+        if not prepare_t1 and not prepare_t2:
+            if reanalyze:
+                prepare_t1 = True
+                prepare_t2 = True
+            else:
+                return {
+                    'message': 'Nothing to prepare. All filings analyzed. Use --reanalyze to re-prepare.',
+                    't1_count': 0, 't2_count': 0,
+                }
+
+    t1_bundles = []
+    t2_bundles = []
+
+    # Helper to get filing text and save to prepared/texts/
+    def _get_and_save_text(filing, max_chars=80000):
+        filepath = filing.get('local_path', '')
+        if not filepath or not os.path.exists(filepath):
+            return None, None
+        try:
+            content = get_cached_text(filepath)
+            if not content:
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as fh:
+                    content = fh.read()
+                if filepath.endswith('.html') or filepath.endswith('.htm'):
+                    content = extract_text_from_html(content)
+            if not content:
+                return None, None
+            truncated = _truncate_text(content, max_chars)
+            acc = filing.get('accession_number', '').replace('-', '')
+            ticker = filing.get('ticker', 'UNKNOWN')
+            text_filename = f"{ticker}_{acc}.txt"
+            text_path = os.path.join(PREPARED_DIR, 'texts', text_filename)
+            with open(text_path, 'w', encoding='utf-8') as fh:
+                fh.write(truncated)
+            return content, os.path.join('prepared', 'texts', text_filename)
+        except Exception as e:
+            logger.warning(f"Failed to extract text for {filing.get('ticker')}: {e}")
+            return None, None
+
+    # Prompt template selection (same logic as analyze_filing_tier1)
+    def _get_t1_prompt_template(form_type):
+        if form_type.startswith('SC 13'):
+            return 'TIER1_OWNERSHIP_PROMPT'
+        elif form_type in ('8-K', '8-K/A'):
+            return 'TIER1_8K_EVENT_PROMPT'
+        elif form_type in ('DEF 14A', 'DEFA14A'):
+            return 'TIER1_DEF14A_PROMPT'
+        else:
+            return 'TIER1_SCREENING_PROMPT'
+
+    # ================================================================
+    # T1 PREPARATION
+    # ================================================================
+    if prepare_t1:
+        if reanalyze:
+            filings_for_t1 = [f for f in scraper.filings_index if f.get('downloaded')]
+        else:
+            filings_for_t1 = [f for f in scraper.filings_index
+                              if f.get('downloaded') and not f.get('llm_analyzed')]
+
+        _progress(f"Preparing T1 bundles for {len(filings_for_t1)} filings...")
+
+        for i, filing in enumerate(filings_for_t1):
+            ticker = filing.get('ticker', 'UNKNOWN')
+            _, text_path = _get_and_save_text(filing)
+            if not text_path:
+                continue
+
+            acc = filing.get('accession_number', '').replace('-', '')
+            form_type = filing.get('form_type', '10-K')
+
+            bundle = {
+                'bundle_type': 't1',
+                'ticker': ticker,
+                'company_name': filing.get('company_name', ''),
+                'form_type': form_type,
+                'filing_date': filing.get('filing_date', ''),
+                'accession_number': filing.get('accession_number', ''),
+                'filing_text_path': text_path,
+                'prompt_template': _get_t1_prompt_template(form_type),
+                'system_prompt': SYSTEM_PROMPT_GEM_FINDER,
+            }
+
+            bundle_filename = f"{ticker}_{acc}.json"
+            bundle_path = os.path.join(PREPARED_DIR, 't1', bundle_filename)
+            with open(bundle_path, 'w') as fh:
+                json.dump(bundle, fh, indent=2)
+            t1_bundles.append(os.path.join('prepared', 't1', bundle_filename))
+
+            if (i + 1) % 10 == 0:
+                _progress(f"T1 prepare: {i+1}/{len(filings_for_t1)}")
+
+        _progress(f"T1 prepared: {len(t1_bundles)} bundles")
+
+    # ================================================================
+    # T2 PREPARATION
+    # ================================================================
+    if prepare_t2:
+        # Need T1 results to compute CPS
+        all_t1 = []
+        for f in scraper.filings_index:
+            if f.get('llm_analyzed') and f.get('tier1_score') is not None:
+                all_t1.append({
+                    'ticker': f.get('ticker', ''),
+                    'company_name': f.get('company_name', ''),
+                    'composite_score': f.get('tier1_score'),
+                    'gem_potential': f.get('gem_potential', ''),
+                    'accession_number': f.get('accession_number'),
+                    'filing_date': f.get('filing_date'),
+                    'local_path': f.get('local_path', ''),
+                    'form_type': f.get('form_type', ''),
+                })
+
+        if not all_t1:
+            _progress("No T1 results available for T2 preparation. Run T1 first.")
+        else:
+            company_scores = compute_company_potential_scores(scraper, all_t1)
+            _progress(f"CPS computed for {len(company_scores)} companies")
+
+            company_count = max(1, int(len(company_scores) * tier2_pct))
+            top_companies = company_scores[:company_count]
+            _progress(f"T2 selecting top {company_count} of {len(company_scores)} companies")
+
+            # Build T2 candidates
+            tier2_candidates = []
+            for comp in top_companies:
+                ticker = comp['ticker']
+                for f_info in comp.get('all_filings', []):
+                    if f_info.get('local_path') and os.path.exists(f_info.get('local_path', '')):
+                        if not reanalyze and f_info.get('tier2_analyzed'):
+                            continue
+                        tier2_candidates.append({
+                            'ticker': ticker,
+                            'company_name': comp['company_name'],
+                            'accession_number': f_info.get('accession_number'),
+                            'filing_date': f_info.get('filing_date'),
+                            'composite_score': f_info.get('tier1_score') or 0,
+                            'form_type': f_info.get('form_type'),
+                            'local_path': f_info.get('local_path'),
+                            'cps': comp['cps'],
+                        })
+
+            tier2_candidates.sort(key=lambda x: (x.get('ticker', ''), x.get('filing_date', '')), reverse=True)
+
+            if not tier2_candidates:
+                _progress("No T2 candidates found (all already analyzed? use --reanalyze)")
+            else:
+                # Build lookups
+                ticker_to_cik = {c.get('ticker', ''): c.get('cik', '') for c in scraper.universe if c.get('ticker')}
+                all_filings_by_ticker = defaultdict(list)
+                for f in scraper.filings_index:
+                    t = f.get('ticker', '')
+                    if t:
+                        all_filings_by_ticker[t].append(f)
+                for t in all_filings_by_ticker:
+                    all_filings_by_ticker[t].sort(key=lambda x: x.get('filing_date', ''), reverse=True)
+
+                # Pre-fetch insider + XBRL + market data
+                edgar_session = _get_session()
+                _insider_cache = {}
+                _xbrl_cache = {}
+                _market_cache = {}
+
+                unique_tickers = list(set(t.get('ticker', '') for t in tier2_candidates if t.get('ticker')))
+                _progress(f"Pre-fetching data for {len(unique_tickers)} tickers...")
+
+                PREFETCH_WORKERS = min(6, len(unique_tickers))
+                prefetch_done = 0
+                with ThreadPoolExecutor(max_workers=PREFETCH_WORKERS) as pf_executor:
+                    pf_futures = {pf_executor.submit(_prefetch_one_ticker, tk, ticker_to_cik, scraper, edgar_session, _edgar_limiter): tk for tk in unique_tickers}
+                    for fut in as_completed(pf_futures):
+                        try:
+                            pf_result = fut.result()
+                            tk = pf_result['ticker']
+                            if pf_result['insider']:
+                                _insider_cache[tk] = pf_result['insider']
+                            if pf_result['xbrl']:
+                                _xbrl_cache[tk] = pf_result['xbrl']
+                            _market_cache[tk] = pf_result.get('market', {})
+                        except Exception as e:
+                            logger.debug("Suppressed error: %s", e)
+                        prefetch_done += 1
+                        if prefetch_done % 5 == 0:
+                            _progress(f"Pre-fetch: {prefetch_done}/{len(unique_tickers)}")
+
+                _progress(f"Building T2 bundles for {len(tier2_candidates)} filings...")
+
+                for i, t1_result in enumerate(tier2_candidates):
+                    ticker = t1_result.get('ticker', 'UNKNOWN')
+                    filepath = t1_result.get('local_path', '')
+                    if not filepath or not os.path.exists(filepath):
+                        continue
+
+                    try:
+                        # Get full text for context assembly
+                        full_content, text_path = _get_and_save_text(t1_result)
+                        if not full_content or not text_path:
+                            continue
+
+                        # Forensics
+                        current_forensics = analyze_language(full_content)
+
+                        # Prior diff
+                        diff_data = None
+                        prior_filing_info = None
+                        current_form = t1_result.get('form_type', '')
+                        current_acc = t1_result.get('accession_number', '')
+
+                        for pf in all_filings_by_ticker.get(ticker, []):
+                            pf_acc = pf.get('accession_number', '')
+                            pf_date = pf.get('filing_date', '')
+                            cur_date = t1_result.get('filing_date', '')
+                            pf_form = pf.get('form_type', '')
+                            if (pf_acc != current_acc and pf_date < cur_date
+                                    and _same_family(current_form, pf_form)
+                                    and pf.get('downloaded') and pf.get('local_path')
+                                    and os.path.exists(pf.get('local_path', ''))):
+                                prior_filing_info = pf
+                                break
+
+                        prior_text = None
+                        if prior_filing_info:
+                            try:
+                                pf_path = prior_filing_info['local_path']
+                                with open(pf_path, 'r', encoding='utf-8', errors='ignore') as pf_fh:
+                                    prior_content = pf_fh.read()
+                                if pf_path.endswith('.html') or pf_path.endswith('.htm'):
+                                    prior_content = extract_text_from_html(prior_content)
+                                prior_text = prior_content
+                                prior_forensics = analyze_language(prior_content)
+                                diff_data = diff_filings(prior_forensics, current_forensics)
+                            except Exception as e:
+                                logger.debug("Suppressed error: %s", e)
+
+                        forensic_prompt = format_forensics_for_prompt(current_forensics, diff_data)
+
+                        # Insider
+                        insider_result = _insider_cache.get(ticker)
+                        if not insider_result:
+                            cached_insider = scraper.get_insider_for_ticker(ticker)
+                            if cached_insider and cached_insider.get('signal') not in ('error', None):
+                                insider_result = cached_insider
+                        insider_prompt = format_insider_for_prompt(insider_result) if insider_result else ""
+
+                        # XBRL
+                        inflection_result = _xbrl_cache.get(ticker)
+                        inflection_prompt = ""
+                        if inflection_result:
+                            try:
+                                filing_timing = analyze_filing_timing(
+                                    t1_result.get('filing_date', ''), t1_result.get('form_type', '10-K'))
+                                inflection_prompt = format_inflection_for_prompt(inflection_result, filing_timing)
+                            except Exception as e:
+                                logger.debug("Suppressed error: %s", e)
+
+                        # Research signals
+                        research_signals_prompt = ""
+                        research_signals_result = None
+                        try:
+                            from filing_signals import compute_all_signals, format_signals_for_prompt
+                            insider_signal_data = _build_insider_signal_data(insider_result)
+                            sigs = compute_all_signals(full_content, prior_text, insider_signal_data,
+                                                       t1_result.get('filing_date', ''),
+                                                       t1_result.get('form_type', '10-K'))
+                            research_signals_result = sigs
+                            research_signals_prompt = format_signals_for_prompt(sigs)
+                        except Exception as e:
+                            logger.debug("Suppressed error: %s", e)
+
+                        # Catalysts
+                        catalyst_prompt = ""
+                        catalyst_result = None
+                        try:
+                            from catalyst_extractor import extract_catalysts, format_catalysts_for_prompt
+                            catalyst_result = extract_catalysts(full_content, t1_result.get('form_type', '10-K'))
+                            catalyst_prompt = format_catalysts_for_prompt(catalyst_result)
+                        except Exception as e:
+                            logger.debug("Suppressed error: %s", e)
+
+                        # Cross-reference context
+                        cross_ref_context = _build_cross_ref_context(ticker, current_acc, all_filings_by_ticker)
+
+                        # Market data
+                        mkt = _market_cache.get(ticker, {})
+                        peer_comparison, short_interest, insider_timing, transcript_signals, market_data_context = \
+                            _build_market_data_context(ticker, mkt, insider_result, t1_result)
+
+                        # Build form-specific context
+                        form_type = t1_result.get('form_type', '10-K')
+                        form_context = ""
+                        if form_type.startswith('SC 13'):
+                            is_activist = 'SC 13D' in form_type.upper()
+                            filing_label = "ACTIVIST (SC 13D)" if is_activist else "PASSIVE LARGE HOLDER (SC 13G)"
+                            form_context = f"NOTE: This is a {form_type} OWNERSHIP FILING ({filing_label})."
+                        elif form_type in ('8-K', '8-K/A'):
+                            form_context = "NOTE: This is an 8-K EVENT FILING."
+                        elif form_type in ('DEF 14A', 'DEFA14A'):
+                            form_context = "NOTE: This is a DEF 14A PROXY STATEMENT."
+
+                        # Assemble T2 bundle
+                        acc = t1_result.get('accession_number', '').replace('-', '')
+                        bundle = {
+                            'bundle_type': 't2',
+                            'ticker': ticker,
+                            'company_name': t1_result.get('company_name', ''),
+                            'form_type': form_type,
+                            'filing_date': t1_result.get('filing_date', ''),
+                            'accession_number': t1_result.get('accession_number', ''),
+                            'cps': t1_result.get('cps', 0),
+                            'filing_text_path': text_path,
+                            'system_prompt': SYSTEM_PROMPT_DEEP_ANALYSIS,
+                            'opus_instructions': OPUS_DEEP_ANALYSIS_INSTRUCTIONS,
+                            'context': {
+                                'forensic_data': forensic_prompt,
+                                'insider_data': insider_prompt,
+                                'inflection_data': inflection_prompt,
+                                'research_signals_data': research_signals_prompt,
+                                'catalyst_data': catalyst_prompt,
+                                'cross_ref_context': cross_ref_context,
+                                'peer_comparison': peer_comparison,
+                                'short_interest': short_interest,
+                                'insider_timing': insider_timing,
+                                'transcript_signals': transcript_signals,
+                                'market_data_context': market_data_context,
+                                'form_context': form_context,
+                            },
+                            'import_context': {
+                                't1_result': {
+                                    'ticker': ticker,
+                                    'company_name': t1_result.get('company_name', ''),
+                                    'composite_score': t1_result.get('composite_score', 0),
+                                    'accession_number': t1_result.get('accession_number', ''),
+                                    'filing_date': t1_result.get('filing_date', ''),
+                                    'form_type': form_type,
+                                },
+                                'diff_data': diff_data,
+                                'prior_filing_info': {
+                                    'filing_date': prior_filing_info.get('filing_date', ''),
+                                } if prior_filing_info else None,
+                                'insider_result': insider_result,
+                                'inflection_result': inflection_result,
+                                'research_signals_result': research_signals_result,
+                                'catalyst_result': catalyst_result,
+                                'current_forensics': current_forensics,
+                            },
+                        }
+
+                        bundle_filename = f"{ticker}_{acc}.json"
+                        bundle_path = os.path.join(PREPARED_DIR, 't2', bundle_filename)
+                        with open(bundle_path, 'w') as fh:
+                            json.dump(bundle, fh, indent=2, default=str)
+                        t2_bundles.append(os.path.join('prepared', 't2', bundle_filename))
+
+                        if (i + 1) % 5 == 0:
+                            _progress(f"T2 prepare: {i+1}/{len(tier2_candidates)}")
+
+                    except Exception as e:
+                        logger.warning(f"T2 prepare failed for {ticker}: {e}")
+                        continue
+
+                _progress(f"T2 prepared: {len(t2_bundles)} bundles")
+
+    # Write manifest
+    manifest = {
+        'created_at': datetime.now().isoformat(),
+        't1_bundles': t1_bundles,
+        't2_bundles': t2_bundles,
+        't1_count': len(t1_bundles),
+        't2_count': len(t2_bundles),
+    }
+    manifest_path = os.path.join(PREPARED_DIR, 'manifest.json')
+    with open(manifest_path, 'w') as fh:
+        json.dump(manifest, fh, indent=2)
+
+    _progress(f"Manifest written: {len(t1_bundles)} T1 + {len(t2_bundles)} T2 bundles")
+    return manifest
+
+
+# ============================================================================
+# LOCAL ANALYSIS: IMPORT RESULTS
+# ============================================================================
+def import_analysis_results(tier='auto', prepared_dir='prepared',
+                            progress_fn=None) -> Dict:
+    """
+    Import analysis results produced by Claude Code back into the system.
+
+    Reads JSON results from prepared/t1_results/ and prepared/t2_results/,
+    updates the filings index, and saves result files.
+
+    Args:
+        tier: 'auto', '1', or '2' — which tier to import
+        prepared_dir: Path to prepared directory (default: 'prepared')
+        progress_fn: Callback for progress updates
+
+    Returns:
+        Dict with import counts and status
+    """
+    scraper = get_scraper()
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.abspath(os.path.join(project_root, prepared_dir))
+    # Validate that prepared_dir is within the project directory to prevent path traversal
+    if not base_dir.startswith(project_root):
+        raise ValueError(f"prepared_dir must be within project directory, got: {prepared_dir}")
+
+    def _progress(msg):
+        if progress_fn:
+            progress_fn(msg)
+        else:
+            logger.info(msg)
+
+    t1_imported = 0
+    t2_imported = 0
+    errors = []
+
+    # Determine what to import
+    import_t1 = False
+    import_t2 = False
+
+    t1_results_dir = os.path.join(base_dir, 't1_results')
+    t2_results_dir = os.path.join(base_dir, 't2_results')
+    t1_bundles_dir = os.path.join(base_dir, 't1')
+    t2_bundles_dir = os.path.join(base_dir, 't2')
+
+    if tier == '1':
+        import_t1 = True
+    elif tier == '2':
+        import_t2 = True
+    else:
+        # Auto-detect from available results
+        if os.path.isdir(t1_results_dir) and os.listdir(t1_results_dir):
+            import_t1 = True
+        if os.path.isdir(t2_results_dir) and os.listdir(t2_results_dir):
+            import_t2 = True
+
+    if not import_t1 and not import_t2:
+        return {
+            'message': 'No results found to import. Run analysis first, writing results to prepared/t1_results/ or prepared/t2_results/.',
+            't1_imported': 0, 't2_imported': 0, 'errors': [],
+        }
+
+    # ================================================================
+    # T1 IMPORT
+    # ================================================================
+    if import_t1 and os.path.isdir(t1_results_dir):
+        result_files = [f for f in os.listdir(t1_results_dir) if f.endswith('.json')]
+        _progress(f"Importing {len(result_files)} T1 results...")
+
+        for result_file in result_files:
+            try:
+                result_path = os.path.join(t1_results_dir, result_file)
+                with open(result_path, 'r') as fh:
+                    t1_result = json.load(fh)
+
+                # Load matching bundle for metadata
+                bundle_path = os.path.join(t1_bundles_dir, result_file)
+                bundle = None
+                if os.path.exists(bundle_path):
+                    with open(bundle_path, 'r') as fh:
+                        bundle = json.load(fh)
+
+                ticker = t1_result.get('ticker', bundle.get('ticker', 'UNKNOWN') if bundle else 'UNKNOWN')
+                accession = t1_result.get('accession_number',
+                                          bundle.get('accession_number', '') if bundle else '')
+                filing_date = t1_result.get('filing_date',
+                                            bundle.get('filing_date', '') if bundle else '')
+
+                # Add standard metadata
+                t1_result['analysis_tier'] = 1
+                t1_result['model_used'] = 'claude-code-haiku'
+                if 'analyzed_at' not in t1_result:
+                    t1_result['analyzed_at'] = datetime.now().isoformat()
+
+                # Warn if score is in 0-10 range (possible scale mismatch)
+                cs = t1_result.get('composite_score')
+                if cs is not None and cs <= 10:
+                    logger.warning("LLM returned score in 0-10 range: %s", cs)
+
+                # Save to results/
+                result_filename = f"{ticker}_tier1_{filing_date}.json"
+                save_path = os.path.join(RESULTS_FOLDER, result_filename)
+                with open(save_path, 'w') as fh:
+                    json.dump(t1_result, fh, indent=2)
+
+                # Update filings_index
+                for f in scraper.filings_index:
+                    if f.get('accession_number') == accession:
+                        f['llm_analyzed'] = True
+                        f['tier1_score'] = t1_result.get('composite_score')
+                        f['gem_potential'] = t1_result.get('gem_potential')
+                        f['tier1_result_file'] = result_filename
+                        break
+
+                t1_imported += 1
+
+            except Exception as e:
+                errors.append(f"T1 import {result_file}: {e}")
+                logger.warning(f"T1 import failed for {result_file}: {e}")
+
+        scraper._save_state()
+        _progress(f"T1 imported: {t1_imported} results")
+
+    # ================================================================
+    # T2 IMPORT
+    # ================================================================
+    if import_t2 and os.path.isdir(t2_results_dir):
+        result_files = [f for f in os.listdir(t2_results_dir) if f.endswith('.json')]
+        _progress(f"Importing {len(result_files)} T2 results...")
+
+        for result_file in result_files:
+            try:
+                result_path = os.path.join(t2_results_dir, result_file)
+                with open(result_path, 'r') as fh:
+                    t2_result = json.load(fh)
+
+                # Load matching bundle for import_context
+                bundle_path = os.path.join(t2_bundles_dir, result_file)
+                bundle = None
+                if os.path.exists(bundle_path):
+                    with open(bundle_path, 'r') as fh:
+                        bundle = json.load(fh)
+
+                if not bundle:
+                    errors.append(f"T2 import {result_file}: no matching bundle found")
+                    continue
+
+                import_ctx = bundle.get('import_context', {})
+                ticker = bundle.get('ticker', 'UNKNOWN')
+
+                # Add standard metadata
+                t2_result['analysis_tier'] = 2
+                t2_result['model_used'] = 'claude-code-opus'
+                if 'analyzed_at' not in t2_result:
+                    t2_result['analyzed_at'] = datetime.now().isoformat()
+
+                # Warn if score is in 0-10 range (possible scale mismatch)
+                fgs = t2_result.get('final_gem_score')
+                if fgs is not None and fgs <= 10:
+                    logger.warning("LLM returned score in 0-10 range: %s", fgs)
+
+                # Build ctx for _save_t2_result_to_index
+                ctx = {
+                    'ticker': ticker,
+                    't1_result': import_ctx.get('t1_result', {}),
+                    'diff_data': import_ctx.get('diff_data'),
+                    'prior_filing_info': import_ctx.get('prior_filing_info'),
+                    'insider_result': import_ctx.get('insider_result'),
+                    'inflection_result': import_ctx.get('inflection_result'),
+                    'research_signals_result': import_ctx.get('research_signals_result'),
+                    'catalyst_result': import_ctx.get('catalyst_result'),
+                    'current_forensics': import_ctx.get('current_forensics'),
+                }
+
+                _save_t2_result_to_index(t2_result, ctx, scraper)
+                t2_imported += 1
+
+            except Exception as e:
+                errors.append(f"T2 import {result_file}: {e}")
+                logger.warning(f"T2 import failed for {result_file}: {e}")
+
+        scraper._save_state()
+        _progress(f"T2 imported: {t2_imported} results")
+
+    sync_db()
+
+    # Auto-collect outcomes after import
+    if t2_imported > 0:
+        try:
+            outcome_summary = auto_collect_outcomes(include_t1=True)
+            _progress(f"Outcomes collected: {outcome_summary.get('collected', 0)} filings")
+        except Exception as e:
+            logger.warning(f"Auto outcome collection failed: {e}")
+
+    result = {
+        't1_imported': t1_imported,
+        't2_imported': t2_imported,
+        'errors': errors,
+        'error_count': len(errors),
+    }
+    _progress(f"Import complete: {t1_imported} T1 + {t2_imported} T2 ({len(errors)} errors)")
+    return result
+
+
+# ============================================================================
+# AUTO OUTCOME COLLECTION (Phase 1G)
+# ============================================================================
+def auto_collect_outcomes(include_t1: bool = True) -> Dict:
+    """
+    Gather all analyzed filings, fetch their price outcomes via batch_backtest,
+    and capture signal snapshots. Returns summary stats.
+    """
+    scraper = get_scraper()
+
+    # Gather filings with dates that have been analyzed
+    filings_to_track = []
+    for f in scraper.filings_index:
+        if not f.get('filing_date'):
+            continue
+        if include_t1:
+            if not (f.get('llm_analyzed') or f.get('tier2_analyzed')):
+                continue
+        else:
+            if not f.get('tier2_analyzed'):
+                continue
+        filings_to_track.append({
+            'ticker': f.get('ticker', ''),
+            'filing_date': f.get('filing_date', ''),
+            'final_gem_score': f.get('final_gem_score'),
+            'gem_score': f.get('tier1_score', 0),
+            'conviction': f.get('conviction', ''),
+            'cps': 0,
+        })
+
+    if not filings_to_track:
+        return {'collected': 0, 'with_returns': 0, 'pending_windows': 0}
+
+    # Build CPS lookup
+    potential = []
+    try:
+        potential = get_potential()
+        cps_lookup = {c.get('ticker', ''): c.get('cps', 0) for c in potential}
+        for fl in filings_to_track:
+            fl['cps'] = cps_lookup.get(fl['ticker'], 0)
+    except Exception as e:
+        logger.debug("Suppressed error: %s", e)
+
+    # Run batch backtest with DB sync
+    try:
+        from market_data import batch_backtest, BACKTEST_WINDOWS
+    except ImportError as e:
+        logger.warning("market_data module not available: %s", e)
+        return {'collected': len(filings_to_track), 'with_returns': 0, 'pending_windows': 0}
+    results = batch_backtest(filings_to_track, db_sync=True)
+
+    with_returns = sum(1 for r in results if r.get('windows') and len(r['windows']) > 0)
+    pending = 0
+    now = datetime.now()
+    for fl in filings_to_track:
+        try:
+            fd = datetime.strptime(fl['filing_date'][:10], '%Y-%m-%d')
+            for w in BACKTEST_WINDOWS:
+                if (fd + timedelta(days=w)) > now:
+                    pending += 1
+                    break
+        except ValueError:
+            pass
+
+    # Capture signal snapshots for all tracked filings
+    try:
+        if not potential:
+            potential = get_potential()
+        for fl in filings_to_track:
+            try:
+                capture_signal_snapshot(fl['ticker'], fl['filing_date'], potential)
+            except Exception as e:
+                logger.debug("Suppressed error: %s", e)
+    except Exception as e:
+        logger.debug("Suppressed error: %s", e)
+
+    # ---- Auto-calibration trigger ----
+    # If we have sufficient new data, automatically run calibration
+    calibration_triggered = False
+    calibration_report = None
+
+    if with_returns >= CALIBRATION_THRESHOLD:
+        try:
+            # Check when calibration was last run
+            cal_dir = os.environ.get("CALIBRATION_DIR", "sec_data/calibration")
+            history_path = os.path.join(cal_dir, "calibration_history.json")
+            should_calibrate = False
+
+            if os.path.exists(history_path):
+                with open(history_path) as hf:
+                    history = json.load(hf)
+                if history:
+                    last_run = history[-1].get('timestamp', '')
+                    last_count = history[-1].get('companies_with_returns', 0)
+                    try:
+                        last_dt = datetime.fromisoformat(last_run)
+                        days_since = (now - last_dt).days
+                        new_data = with_returns - last_count
+                        # Trigger if: >7 days since last cal AND >5 new data points
+                        if days_since >= 7 and new_data >= 5:
+                            should_calibrate = True
+                        # Or if: >30 days since last cal regardless
+                        elif days_since >= 30:
+                            should_calibrate = True
+                    except (ValueError, TypeError):
+                        should_calibrate = True
+                else:
+                    should_calibrate = True  # No history entries
+            else:
+                should_calibrate = True  # No history file
+
+            if should_calibrate:
+                logger.info(f"Auto-calibration triggered ({with_returns} companies with returns)")
+                try:
+                    from calibration import CalibrationEngine
+                    cal_engine = CalibrationEngine(get_scraper(), potential or get_potential())
+                    calibration_report = cal_engine.run_full_calibration()
+                    calibration_triggered = True
+                    logger.info("Auto-calibration completed")
+                except Exception as cal_err:
+                    logger.warning(f"Auto-calibration failed: {cal_err}")
+        except Exception as e:
+            logger.debug(f"Auto-calibration check error: {e}")
+
+    return {
+        'collected': len(filings_to_track),
+        'with_returns': with_returns,
+        'pending_windows': pending,
+        'calibration_triggered': calibration_triggered,
+        'calibration_status': calibration_report.get('status', '') if calibration_report else None,
+    }
+
+
+def capture_signal_snapshot(ticker: str, filing_date: str,
+                            potential_companies: List[Dict] = None) -> Dict[str, float]:
+    """
+    Extract and save a signal vector snapshot for a ticker at a given filing date.
+    This captures time-sensitive signals (like days_since_filing) at the analysis moment.
+    """
+    scraper = get_scraper()
+    if potential_companies is None:
+        potential_companies = get_potential()
+
+    from calibration import extract_signal_vector
+    signals = extract_signal_vector(ticker, scraper, potential_companies)
+
+    if not signals:
+        return {}
+
+    # Save to results/ directory
+    safe_date = filing_date[:10].replace('-', '')
+    result_path = os.path.join(RESULTS_FOLDER, f"{ticker}_signals_{safe_date}.json")
+    try:
+        with open(result_path, 'w') as f:
+            json.dump({
+                'ticker': ticker,
+                'filing_date': filing_date,
+                'captured_at': datetime.now().isoformat(),
+                'signals': signals,
+            }, f, indent=2)
+    except Exception as e:
+        logger.debug(f"Failed to save signal snapshot for {ticker}: {e}")
+
+    return signals
 
 
 # ============================================================================
@@ -1143,8 +2142,8 @@ def get_gems() -> List[Dict]:
                         if data.get('one_liner'):
                             one_liner = data['one_liner']
                             break
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Suppressed error: %s", e)
 
         # Sentiment trend
         sentiment = 'stable'
@@ -1171,6 +2170,32 @@ def get_gems() -> List[Dict]:
             'filing_count': len(filings),
             'latest_date': filings[0].get('filing_date', ''),
         })
+
+    # Attach confidence scores from backtest data (Phase 5)
+    try:
+        backtest_cache = os.path.join(
+            os.environ.get("MARKET_DATA_DIR", "sec_data/market_data"),
+            "backtest_results.json",
+        )
+        backtest_results = []
+        if os.path.exists(backtest_cache):
+            with open(backtest_cache) as f:
+                backtest_results = json.load(f)
+
+        if backtest_results:
+            from calibration import compute_score_confidence
+            for stock in stocks:
+                try:
+                    conf = compute_score_confidence(
+                        stock['gem_score'], 0,
+                        stock.get('filing_count', 0),
+                        backtest_results,
+                    )
+                    stock['confidence'] = conf
+                except Exception as e:
+                    logger.debug("Suppressed error: %s", e)
+    except Exception as e:
+        logger.debug("Suppressed error: %s", e)
 
     stocks.sort(key=lambda x: x['gem_score'], reverse=True)
     return stocks
@@ -1222,8 +2247,8 @@ def get_company_detail(ticker: str) -> Dict:
                 try:
                     with open(rpath) as fp:
                         t2_results.append(json.load(fp))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Suppressed error: %s", e)
 
     return {
         'ticker': ticker,
@@ -1236,8 +2261,13 @@ def get_company_detail(ticker: str) -> Dict:
 # ============================================================================
 # BACKTEST
 # ============================================================================
-def run_backtest(clear_cache=False) -> Dict:
-    """Run price backtesting on all T2 analyzed filings."""
+def run_backtest(clear_cache=False, include_t1=False) -> Dict:
+    """Run price backtesting on analyzed filings.
+
+    Args:
+        clear_cache: Clear cached backtest results before running
+        include_t1: Include T1-only filings (not just T2)
+    """
     scraper = get_scraper()
 
     if clear_cache:
@@ -1260,27 +2290,36 @@ def run_backtest(clear_cache=False) -> Dict:
             'ticker': f.get('ticker'),
             'filing_date': f.get('filing_date'),
             'final_gem_score': f.get('final_gem_score'),
+            'gem_score': f.get('tier1_score', 0),
             'conviction': f.get('conviction', ''),
             'cps': cps_lookup.get(f.get('ticker', ''), 0),
         }
         for f in scraper.filings_index
-        if f.get('tier2_analyzed') and f.get('filing_date')
+        if f.get('filing_date') and (
+            f.get('tier2_analyzed') or
+            (include_t1 and f.get('llm_analyzed'))
+        )
     ]
 
     if not filings:
-        return {'error': 'No Tier 2 analyzed filings to backtest', 'total': 0}
+        msg = 'No analyzed filings to backtest'
+        if not include_t1:
+            msg = 'No Tier 2 analyzed filings to backtest (try --all-filings for T1)'
+        return {'error': msg, 'total': 0}
 
     from market_data import batch_backtest, compute_backtest_stats
-    results = batch_backtest(filings)
+    results = batch_backtest(filings, db_sync=True)
     stats = compute_backtest_stats(results)
 
     # Flatten stats
     flat = dict(stats)
     by_w = stats.get('by_window', {})
-    for window in ['30', '60', '90']:
+    for window in ['30', '60', '90', '180']:
         w = by_w.get(window, {})
         flat[f'avg_{window}d'] = w.get('avg_return', 0)
         flat[f'win_rate_{window}d'] = w.get('win_rate', 0)
+        flat[f'avg_alpha_{window}d'] = w.get('avg_alpha', 0)
+        flat[f'alpha_win_rate_{window}d'] = w.get('alpha_win_rate', 0)
 
     errors = [r for r in results if r.get('error')]
     with_data = [r for r in results if r.get('windows') and len(r['windows']) > 0]
@@ -1306,23 +2345,28 @@ def run_backtest(clear_cache=False) -> Dict:
             'return_30d': w.get('30', {}).get('change_pct'),
             'return_60d': w.get('60', {}).get('change_pct'),
             'return_90d': w.get('90', {}).get('change_pct'),
+            'return_180d': w.get('180', {}).get('change_pct'),
+            'alpha_90d': w.get('90', {}).get('alpha'),
             'hit': r.get('hit', False),
             'error': r.get('error', ''),
         })
 
-    return {'total': len(results), 'stats': flat, 'results': individual}
+    return {'total': len(results), 'stats': flat, 'results': individual,
+            'include_t1': include_t1}
 
 
 # ============================================================================
 # CALIBRATION
 # ============================================================================
-def run_calibration(return_window=90, auto_apply=False) -> Dict:
+def run_calibration(return_window=90, auto_apply=False,
+                    multi_window=False) -> Dict:
     """Run feedback loop calibration."""
     scraper = get_scraper()
     potential = get_potential()
     from calibration import CalibrationEngine
-    engine = CalibrationEngine(scraper, potential, data_dir=scraper.base_dir)
-    report = engine.run_full_calibration(return_window=return_window)
+    engine = CalibrationEngine(scraper, potential, data_dir=scraper.data_dir)
+    report = engine.run_full_calibration(return_window=return_window,
+                                         multi_window=multi_window)
     if auto_apply and report.get('weight_optimization', {}).get('suggested_weights'):
         engine.apply_weights(report['weight_optimization']['suggested_weights'])
         report['weights_applied'] = True
@@ -1363,7 +2407,9 @@ def export_csv(output_path: str = None) -> str:
     import csv
     if output_path is None:
         output_path = os.path.join('sec_data', 'export.csv')
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    dirname = os.path.dirname(output_path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
 
     gems = get_gems()
     with open(output_path, 'w', newline='') as f:
@@ -1381,6 +2427,170 @@ def export_csv(output_path: str = None) -> str:
     return output_path
 
 
+# ============================================================================
+# PORTFOLIO RISK ANALYSIS
+# ============================================================================
+
+def analyze_portfolio(top_n: int = 10, max_sector_pct: float = 0.35) -> Dict:
+    """
+    Portfolio-level risk analysis for top gem picks.
+
+    Computes:
+    - Position sizing based on conviction and score
+    - Sector concentration analysis
+    - Correlation between picks (based on signal vector similarity)
+    - Diversification score
+
+    Args:
+        top_n: Number of top picks to include in portfolio
+        max_sector_pct: Maximum portfolio allocation to any one sector
+
+    Returns:
+        Dict with positions, sector_exposure, diversification metrics
+    """
+    scraper = get_scraper()
+    potential = get_potential()
+
+    if not potential:
+        return {"error": "No analyzed companies available", "positions": []}
+
+    # Get top gems (T2 analyzed first, then T1)
+    gems = []
+    for c in potential[:top_n * 2]:
+        tk = c.get('ticker', '')
+        filings = [f for f in scraper.filings_index
+                   if f.get('ticker', '').upper() == tk.upper()]
+        filings.sort(key=lambda x: x.get('filing_date', ''), reverse=True)
+
+        t2_filings = [f for f in filings if f.get('tier2_analyzed')]
+        best_filing = t2_filings[0] if t2_filings else (filings[0] if filings else {})
+
+        gem_score = best_filing.get('final_gem_score') or c.get('best_t1_score', 0)
+        conviction = best_filing.get('conviction', 'low')
+
+        # Find company in universe for sector data
+        company = next((co for co in scraper.universe
+                        if co.get('ticker', '').upper() == tk.upper()), {})
+
+        gems.append({
+            'ticker': tk,
+            'company_name': c.get('company_name', ''),
+            'gem_score': gem_score,
+            'cps': c.get('cps', 0),
+            'conviction': conviction,
+            'sector': company.get('sector', 'Unknown'),
+            'industry': company.get('industry', 'Unknown'),
+            'market_cap': company.get('mktCap', 0),
+            'filing_count': c.get('filing_count', 0),
+        })
+
+    gems.sort(key=lambda g: g['gem_score'], reverse=True)
+    gems = gems[:top_n]
+
+    if not gems:
+        return {"error": "No gems found", "positions": []}
+
+    # ---- Position sizing (conviction-weighted) ----
+    conviction_weights = {"high": 3.0, "medium": 2.0, "low": 1.0}
+    total_raw_weight = 0
+    for g in gems:
+        cw = conviction_weights.get(g['conviction'], 1.0)
+        score_factor = g['gem_score'] / 100.0 if g.get('gem_score') is not None else 0.5
+        g['raw_weight'] = cw * score_factor
+        total_raw_weight += g['raw_weight']
+
+    positions = []
+    for g in gems:
+        if total_raw_weight > 0:
+            pct = g['raw_weight'] / total_raw_weight * 100
+        else:
+            pct = 100.0 / len(gems)
+        positions.append({
+            'ticker': g['ticker'],
+            'company_name': g['company_name'],
+            'gem_score': g['gem_score'],
+            'conviction': g['conviction'],
+            'cps': g['cps'],
+            'sector': g['sector'],
+            'industry': g['industry'],
+            'market_cap': g['market_cap'],
+            'weight_pct': round(pct, 1),
+        })
+
+    # ---- Sector concentration analysis ----
+    sector_exposure = {}
+    for p in positions:
+        sector = p['sector'] or 'Unknown'
+        sector_exposure[sector] = sector_exposure.get(sector, 0) + p['weight_pct']
+
+    # Flag concentrated sectors
+    concentration_warnings = []
+    for sector, pct in sector_exposure.items():
+        if pct > max_sector_pct * 100:
+            concentration_warnings.append(
+                f"{sector}: {pct:.0f}% (exceeds {max_sector_pct*100:.0f}% limit)"
+            )
+
+    # ---- Signal similarity (correlation proxy) ----
+    # Compute pairwise signal vector similarity between portfolio companies
+    from calibration import extract_signal_vector
+    signal_vecs = {}
+    for p in positions:
+        try:
+            sv = extract_signal_vector(p['ticker'], scraper, potential)
+            signal_vecs[p['ticker']] = sv
+        except Exception as e:
+            logger.debug("Suppressed error: %s", e)
+
+    # Cosine similarity between signal vectors
+    high_correlation_pairs = []
+    tickers_list = list(signal_vecs.keys())
+    for i in range(len(tickers_list)):
+        for j in range(i + 1, len(tickers_list)):
+            tk_a, tk_b = tickers_list[i], tickers_list[j]
+            sv_a, sv_b = signal_vecs[tk_a], signal_vecs[tk_b]
+
+            # Compute cosine similarity on shared keys
+            shared_keys = set(sv_a.keys()) & set(sv_b.keys())
+            if len(shared_keys) < 3:
+                continue
+            dot = sum(sv_a[k] * sv_b[k] for k in shared_keys)
+            mag_a = sum(sv_a[k] ** 2 for k in shared_keys) ** 0.5
+            mag_b = sum(sv_b[k] ** 2 for k in shared_keys) ** 0.5
+            if mag_a > 0 and mag_b > 0:
+                similarity = dot / (mag_a * mag_b)
+                if similarity > 0.85:
+                    high_correlation_pairs.append({
+                        'pair': f"{tk_a} / {tk_b}",
+                        'similarity': round(similarity, 3),
+                    })
+
+    # ---- Diversification score (0-100) ----
+    unique_sectors = len(set(p['sector'] for p in positions))
+    max_sector_weight = max(sector_exposure.values()) if sector_exposure else 100
+    hhi = sum((v / 100) ** 2 for v in sector_exposure.values())  # Herfindahl index
+
+    # Score: penalize for concentration (high HHI) and low sector count
+    diversification_score = max(0, min(100, int(
+        40 * (1 - hhi) +                                    # HHI component (0-40)
+        30 * min(1, unique_sectors / 5) +                    # Sector count (0-30)
+        30 * (1 - max_sector_weight / 100)                   # Max sector weight (0-30)
+    )))
+
+    return {
+        "positions": positions,
+        "position_count": len(positions),
+        "sector_exposure": {k: round(v, 1) for k, v in
+                           sorted(sector_exposure.items(), key=lambda x: -x[1])},
+        "unique_sectors": unique_sectors,
+        "concentration_warnings": concentration_warnings,
+        "high_correlation_pairs": high_correlation_pairs,
+        "diversification_score": diversification_score,
+        "herfindahl_index": round(hhi, 4),
+        "max_sector_weight": round(max_sector_weight, 1),
+    }
+
+
 def backup_data(output_path: str = None) -> str:
     """Zip sec_data/ for safekeeping."""
     import zipfile
@@ -1392,6 +2602,15 @@ def backup_data(output_path: str = None) -> str:
     if not os.path.exists(data_dir):
         raise RuntimeError(f"Data directory not found: {data_dir}")
 
+    # Check total size before creating backup
+    total_size = 0
+    for root, dirs, files in os.walk(data_dir):
+        for file in files:
+            total_size += os.path.getsize(os.path.join(root, file))
+    if total_size > 100 * 1024 * 1024:  # 100MB
+        logger.warning("Backup data exceeds 100MB (%d MB). This may take a while.",
+                       total_size // (1024 * 1024))
+
     with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
         for root, dirs, files in os.walk(data_dir):
             for file in files:
@@ -1401,5 +2620,9 @@ def backup_data(output_path: str = None) -> str:
     return output_path
 
 
-# Initialize on import
-restore_keys()
+def _init_module():
+    """Initialize module — restore API keys from config."""
+    restore_keys()
+
+
+_init_module()

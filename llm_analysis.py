@@ -13,6 +13,9 @@ import os
 import json
 import re
 import logging
+import copy
+import time as _time
+import threading
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
@@ -64,7 +67,7 @@ DEFAULT_TIER2_MODEL = "claude-haiku"
 
 # Effort level presets: controls intelligence vs speed/cost tradeoff for Opus
 EFFORT_LEVELS = {
-    "low": {"description": "Fast, cheap — simple filings", "thinking_budget": 0},
+    "low": {"description": "Fast, cheap — simple filings", "thinking_budget": 1024},
     "medium": {"description": "Balanced — standard analysis", "thinking_budget": 2048},
     "high": {"description": "Thorough — conflicting signals", "thinking_budget": 8192},
     "max": {"description": "Maximum depth — hardest cases", "thinking_budget": 16384},
@@ -75,8 +78,6 @@ EFFORT_LEVELS = {
 # API CLIENTS
 # ============================================================================
 
-import time as _time
-
 # Cached API clients (reuse connections)
 _openai_client = None
 _anthropic_client = None
@@ -85,9 +86,11 @@ MAX_LLM_RETRIES = 3
 RETRY_BACKOFF_BASE = 2.0  # seconds
 
 # Token usage tracking for actual cost computation (#23)
+# Thread safety: _cumulative_usage protected by _usage_lock
 _last_token_usage = {}  # Updated after each LLM call
 _cumulative_usage = {"total_input_tokens": 0, "total_output_tokens": 0,
                      "total_cost_usd": 0.0, "calls": 0, "by_model": {}}
+_usage_lock = threading.Lock()
 
 
 def get_last_token_usage() -> Dict:
@@ -97,7 +100,7 @@ def get_last_token_usage() -> Dict:
 
 def get_cumulative_usage() -> Dict:
     """Get cumulative token usage and cost across all calls."""
-    return dict(_cumulative_usage)
+    return copy.deepcopy(_cumulative_usage)
 
 
 def _track_usage(model_name: str, input_tokens: int, output_tokens: int):
@@ -113,20 +116,21 @@ def _track_usage(model_name: str, input_tokens: int, output_tokens: int):
         cost = (input_tokens * config.get("input_cost_per_1m", 0) / 1_000_000 +
                 output_tokens * config.get("output_cost_per_1m", 0) / 1_000_000)
 
-    _cumulative_usage["total_input_tokens"] += input_tokens
-    _cumulative_usage["total_output_tokens"] += output_tokens
-    _cumulative_usage["total_cost_usd"] += cost
-    _cumulative_usage["calls"] += 1
+    with _usage_lock:
+        _cumulative_usage["total_input_tokens"] += input_tokens
+        _cumulative_usage["total_output_tokens"] += output_tokens
+        _cumulative_usage["total_cost_usd"] += cost
+        _cumulative_usage["calls"] += 1
 
-    if model_name not in _cumulative_usage["by_model"]:
-        _cumulative_usage["by_model"][model_name] = {
-            "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0
-        }
-    m = _cumulative_usage["by_model"][model_name]
-    m["input_tokens"] += input_tokens
-    m["output_tokens"] += output_tokens
-    m["cost_usd"] += cost
-    m["calls"] += 1
+        if model_name not in _cumulative_usage["by_model"]:
+            _cumulative_usage["by_model"][model_name] = {
+                "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0
+            }
+        m = _cumulative_usage["by_model"][model_name]
+        m["input_tokens"] += input_tokens
+        m["output_tokens"] += output_tokens
+        m["cost_usd"] += cost
+        m["calls"] += 1
 
     return cost
 
@@ -197,15 +201,29 @@ def _call_openai(prompt: str, system: str, model: str = "gpt-4o-mini",
                 _track_usage(model, response.usage.prompt_tokens,
                              response.usage.completion_tokens)
             return response.choices[0].message.content
+        except (ConnectionError, TimeoutError, OSError) as e:
+            last_error = e
+            wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+            logger.warning(f"OpenAI retry {attempt+1}/{MAX_LLM_RETRIES} after {wait}s: {e}")
+            _time.sleep(wait)
+            continue
         except Exception as e:
             last_error = e
-            err_str = str(e).lower()
-            # Retry on rate limits, timeouts, and server errors
-            if any(kw in err_str for kw in ('rate', '429', 'timeout', '500', '502', '503', '529', 'overloaded')):
-                wait = RETRY_BACKOFF_BASE * (2 ** attempt)
-                logger.warning(f"OpenAI retry {attempt+1}/{MAX_LLM_RETRIES} after {wait}s: {e}")
-                _time.sleep(wait)
-                continue
+            # Check for retryable HTTP status codes via exception type
+            try:
+                from openai import RateLimitError, APIStatusError, APITimeoutError
+                if isinstance(e, (RateLimitError, APITimeoutError)):
+                    wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+                    logger.warning(f"OpenAI retry {attempt+1}/{MAX_LLM_RETRIES} after {wait}s: {e}")
+                    _time.sleep(wait)
+                    continue
+                if isinstance(e, APIStatusError) and getattr(e, 'status_code', 0) in (500, 502, 503, 529):
+                    wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+                    logger.warning(f"OpenAI retry {attempt+1}/{MAX_LLM_RETRIES} after {wait}s: {e}")
+                    _time.sleep(wait)
+                    continue
+            except ImportError:
+                pass
             # Non-retryable error
             break
 
@@ -217,6 +235,7 @@ def _call_anthropic(prompt: str, system: str, model: str = "claude-haiku-4-5-202
                     max_tokens: int = 2000, thinking_budget: int = 0,
                     effort: str = "") -> Optional[str]:
     """Call Anthropic Claude API with retry, optional extended thinking and effort levels."""
+    global _last_token_usage
     client = _get_anthropic_client()
 
     # Build request kwargs
@@ -242,11 +261,7 @@ def _call_anthropic(prompt: str, system: str, model: str = "claude-haiku-4-5-202
 
     # Add effort level if specified (Opus 4.6+ feature)
     if effort and effort in ("low", "medium", "high", "max"):
-        try:
-            kwargs["metadata"] = kwargs.get("metadata", {})
-            kwargs["effort"] = effort
-        except Exception:
-            pass  # Older SDK — effort not supported, no-op
+        kwargs["effort"] = effort
 
     last_error = None
     for attempt in range(MAX_LLM_RETRIES):
@@ -286,14 +301,29 @@ def _call_anthropic(prompt: str, system: str, model: str = "claude-haiku-4-5-202
 
             return result
 
+        except (ConnectionError, TimeoutError, OSError) as e:
+            last_error = e
+            wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+            logger.warning(f"Anthropic retry {attempt+1}/{MAX_LLM_RETRIES} after {wait}s: {e}")
+            _time.sleep(wait)
+            continue
         except Exception as e:
             last_error = e
-            err_str = str(e).lower()
-            if any(kw in err_str for kw in ('rate', '429', 'timeout', '500', '502', '503', '529', 'overloaded')):
-                wait = RETRY_BACKOFF_BASE * (2 ** attempt)
-                logger.warning(f"Anthropic retry {attempt+1}/{MAX_LLM_RETRIES} after {wait}s: {e}")
-                _time.sleep(wait)
-                continue
+            # Check for retryable errors via exception type
+            try:
+                from anthropic import RateLimitError, APIStatusError, APITimeoutError
+                if isinstance(e, (RateLimitError, APITimeoutError)):
+                    wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+                    logger.warning(f"Anthropic retry {attempt+1}/{MAX_LLM_RETRIES} after {wait}s: {e}")
+                    _time.sleep(wait)
+                    continue
+                if isinstance(e, APIStatusError) and getattr(e, 'status_code', 0) in (500, 502, 503, 529):
+                    wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+                    logger.warning(f"Anthropic retry {attempt+1}/{MAX_LLM_RETRIES} after {wait}s: {e}")
+                    _time.sleep(wait)
+                    continue
+            except ImportError:
+                pass
             break
 
     logger.error(f"Anthropic API error after {MAX_LLM_RETRIES} attempts (model={model}): {last_error}")
@@ -347,8 +377,6 @@ def _call_llm(prompt: str, system: str, model_name: str = "gpt-4o-mini",
         # All fallbacks failed
         logger.error(f"All models failed for request (primary: {model_name})")
         raise primary_error
-
-    return None
 
 
 def _parse_json_response(text: str) -> Optional[Dict]:
@@ -416,9 +444,9 @@ def _parse_json_response(text: str) -> Optional[Dict]:
         # Find the end of the last complete value
         # Move past the comma if there is one
         repaired = repaired[:last_good]
-        # Find what was the last complete token
-        if repaired.endswith('"'):
-            repaired += '"'  # was mid-string
+        # Find what was the last complete token — only add closing quote if not already quoted
+        if repaired.endswith('"') and not repaired.endswith('""'):
+            pass  # Already ends with a quote, no need to add another
         # Count open braces/brackets and close them
         open_braces = repaired.count('{') - repaired.count('}')
         open_brackets = repaired.count('[') - repaired.count(']')
@@ -431,7 +459,12 @@ def _parse_json_response(text: str) -> Optional[Dict]:
             pass
 
     # More aggressive repair: find last valid } or ] and close from there
+    max_attempts = 1000
+    attempts = 0
     for trim_pos in range(len(json_str) - 1, max(len(json_str) // 2, 100), -1):
+        attempts += 1
+        if attempts > max_attempts:
+            break
         ch = json_str[trim_pos]
         if ch in ('}', ']', '"'):
             candidate = json_str[:trim_pos + 1]
@@ -463,7 +496,8 @@ def _truncate_text(text: str, max_chars: int = 100000) -> str:
 # SYSTEM PROMPTS
 # ============================================================================
 
-SYSTEM_PROMPT_GEM_FINDER = """You are an expert microcap stock analyst searching for HIDDEN GEMS - 
+# NOTE: Filing text is user-controlled content from SEC EDGAR. Prompt injection risk documented.
+SYSTEM_PROMPT_GEM_FINDER = """You are an expert microcap stock analyst searching for HIDDEN GEMS -
 undervalued companies with improving fundamentals and authentic, confident management.
 
 Your job is NOT just to avoid disasters. You're looking for:
@@ -473,7 +507,7 @@ Your job is NOT just to avoid disasters. You're looking for:
 - Understated positives and conservative guidance
 
 You analyze SEC filings with a focus on TONE and TRAJECTORY.
-CRITICAL: Respond with RAW JSON only. No markdown, no ```json fences, no backticks. Start with { and end with }."""
+CRITICAL: Respond with RAW JSON only. No markdown, no ```json fences, no backticks."""
 
 
 SYSTEM_PROMPT_DEEP_ANALYSIS = """You are a forensic financial analyst specializing in microcap stocks.
@@ -1037,6 +1071,371 @@ FILING ({form_type}) for {ticker} - {company_name}:
 
 
 # ============================================================================
+# TIER 2: OPUS-LEVEL DEEP ANALYSIS PROMPT (Claude Code local analysis)
+# ============================================================================
+
+# TODO: Refactor to build on TIER2_DEEP_ANALYSIS_PROMPT + opus additions to reduce duplication
+TIER2_OPUS_DEEP_ANALYSIS_PROMPT = """Perform deep qualitative analysis on this potential hidden gem.
+
+This company scored well in initial screening. You have been provided with:
+1. The SEC filing text
+2. QUANTITATIVE forensic language metrics (hedging ratios, confidence patterns, etc.)
+3. Filing-over-filing DIFF DATA showing what changed vs the prior filing (if available)
+4. INSIDER & INSTITUTIONAL ACTIVITY data (Form 4 insider buys/sells, institutional filings)
+5. FINANCIAL INFLECTION ANALYSIS from XBRL data (revenue trends, margin shifts, profitability crossings)
+6. RESEARCH-BACKED FILING SIGNALS — quantitative scores from academic research on SEC filing predictive power
+7. TURNAROUND CATALYST EXTRACTION — algorithmically detected operational catalysts from the filing text
+
+YOUR JOB IS NOT TO SUMMARIZE. Your job is to INTERPRET all signals holistically and explain
+what they mean for this company's investment potential. Focus on:
+
+FORENSIC INTERPRETATION:
+- What does the confidence-to-hedge ratio tell us? Is management genuinely confident?
+- Is the specificity score high (they give real numbers) or low (vague hand-waving)?
+- Is blame language present? Who are they blaming and is it legitimate?
+- Are the forensic scores consistent with what management claims?
+
+FILING DIFF INTERPRETATION (if prior filing data provided):
+- What risk factors were ADDED or REMOVED? What does each change signal?
+- What new statements appeared in MD&A? Are they positive or concerning?
+- What was REMOVED from MD&A? Did they stop talking about something important?
+- Did hedging increase or decrease? Did specificity change?
+- Do the metric shifts tell a different story than management's narrative?
+
+INSIDER ACTIVITY INTERPRETATION (if insider data provided):
+- Are insiders buying with their own money? This is the strongest bullish signal for microcaps.
+- Is there CLUSTER buying (multiple insiders buying in a short window)? Even stronger signal.
+- Are C-suite executives (CEO/CFO) buying? They have the most information.
+- Is there an activist investor (SC 13D)? What does this mean for the stock?
+- Is there net selling? Could be routine or could signal problems — context matters.
+- Does insider behavior CONFIRM or CONTRADICT management's optimistic language in the filing?
+
+FINANCIAL INFLECTION INTERPRETATION (if XBRL data provided):
+- Is revenue ACCELERATING (growth rate increasing)? This is the most important forward indicator.
+- Is the company approaching profitability for the first time? This is a major re-rating catalyst.
+- Are margins expanding? This suggests pricing power or operating leverage kicking in.
+- Is there heavy dilution? This can destroy shareholder value even if the business improves.
+- Is cash runway adequate? Low runway means potential dilutive financing ahead.
+- Does the financial trajectory support or contradict the filing's qualitative narrative?
+
+RESEARCH SIGNALS INTERPRETATION (from academic literature — weights reflect evidence strength):
+You are given four quantitative signals derived from peer-reviewed research on SEC filings:
+- MD&A SIMILARITY (35% weight, from "Lazy Prices" Cohen et al. JF 2020):
+  Measures how much the MD&A section changed vs the prior filing.
+  HIGH similarity = "non-changer" = historically POSITIVE (188bps/month alpha).
+  LOW similarity = "changer" = historically NEGATIVE (predicts bad earnings, news, bankruptcies).
+  This is the SINGLE STRONGEST documented textual alpha signal from SEC filings.
+- RISK FACTOR CHANGES (30% weight, from "Lazy Prices" + Kirtac & Germano 2024):
+  Risk factor section changes are "especially informative for future returns."
+  New risk factors predict negative outcomes. Stable risk section = positive.
+- LEGAL PROCEEDINGS (20% weight, from Offutt & Xie 2025):
+  Expanding legal proceedings = priced legal risk increasing. Alpha unexplained by FF5+momentum.
+  New litigation parties or dollar amounts = bearish.
+- FILING TIMELINESS (15% weight, from Duarte-Silva et al. 2013):
+  Late filers experience performance deterioration. Early = confidence signal.
+
+IMPORTANT: Integrate these research scores with all other signals. Do they CONFIRM or CONTRADICT
+the qualitative narrative? A high gem score with poor research signals suggests the narrative
+may be overly optimistic. A moderate gem score with strong research signals suggests underappreciated stability.
+
+TURNAROUND CATALYST INTERPRETATION (if catalyst data provided):
+You are given algorithmically extracted turnaround catalyst signals across 8 categories:
+cost restructuring, management changes, debt restructuring, margin inflection,
+asset monetization, working capital, activist/ownership, and going concern.
+
+CRITICAL TURNAROUND ASSESSMENT FRAMEWORK:
+- WHERE IN THE TURNAROUND CYCLE? Early (announced restructuring, new management just arrived),
+  mid-cycle (charges flowing, cost cuts executing), or inflection (savings realized, margins turning)?
+  Early-stage turnarounds have high execution risk. Late-stage/inflection = highest conviction setups.
+- ARE CATALYSTS GENUINE OR COSMETIC? Management can restructure forever without results.
+  Look for PROOF: margin improvement, debt paydown, working capital normalization, FCF turning positive.
+  If the catalyst data shows restructuring "complete" but margins aren't improving, be skeptical.
+- CATALYST STACKING: Multiple reinforcing catalysts (e.g., new CEO + debt refinancing + margin improvement)
+  are far more bullish than a single catalyst. Count how many categories are active.
+- GOING CONCERN DIRECTION: If going concern was REMOVED vs prior filing, this is one of the highest-conviction
+  turnaround setups in microcap investing. If ADDED, it's an existential red flag.
+- TIMELINE: Are there specific forward-looking dates? Catalysts with defined timelines are actionable.
+- DOES INSIDER BUYING CONFIRM THE TURNAROUND? Management buying stock during a restructuring
+  is the strongest confirmation signal. If insiders are selling during a "turnaround," be very skeptical.
+
+OPUS-LEVEL DEEP SIGNAL ANALYSIS:
+You are the most capable reasoning model available. Your edge is finding what
+surface-level analysis misses. For EVERY filing, perform these additional analyses:
+
+1. NARRATIVE vs. NUMBERS CROSS-CHECK
+   - For each material claim in MD&A, verify against the financial data provided
+   - "Strong cash generation" -> check operating cash flow. Positive or negative?
+   - "Margin expansion" -> check if gross/operating margins actually improved
+   - "Revenue growth" -> organic or acquisition-driven? One-time or recurring?
+   - Flag EVERY claim the numbers don't support. This is where alpha lives.
+
+2. OMISSION ANALYSIS — What's NOT Being Said
+   - What SHOULD be discussed given the industry/business, but isn't mentioned?
+   - If prior filing discussed a key initiative, is there a progress update? Silence = failure.
+   - If a competitor is dominating, does management acknowledge it? Denial = risk.
+   - If the macro environment changed, did the risk factors update? Stale risks = lazy management.
+   - Omissions are often more informative than what IS said.
+
+3. INFORMATION ASYMMETRY DETECTION
+   - Where does management have information the market likely doesn't?
+   - New contract/partnership language implying a signed but unannounced deal
+   - Capacity expansion + hiring language suggesting demand visibility
+   - Unusually conservative guidance when business metrics are improving (sandbagging = bullish)
+   - Unusual caution around a segment that's outperforming (managing expectations for upside surprise)
+
+4. SECOND-ORDER IMPLICATIONS — If X Then Y
+   - Debt refinancing at lower rates -> improved cash flow -> potential for buybacks or M&A
+   - New restructuring advisor hired -> board likely evaluating strategic alternatives
+   - Auditor change -> could be accounting concerns OR new management cleaning house
+   - CFO departure + insider buying by CEO -> CEO knows something CFO didn't agree with
+   - Each implication should state what it means for the stock price
+
+5. LANGUAGE EVOLUTION PATTERNS (requires prior filing diff)
+   - Track hedging direction: "will" -> "expect" -> "may" = progressive deterioration
+   - Track specificity: vague -> specific = growing confidence; specific -> vague = hiding
+   - Track tone: defensive -> neutral -> confident = turnaround taking hold
+   - One-filing changes are noise. Multi-filing trends are signal.
+
+6. CONTRARIAN SIGNAL DETECTION
+   - What does consensus likely think about this stock? (The obvious read)
+   - Where might consensus be WRONG?
+   - The highest-alpha microcap opportunities are non-consensus correct calls
+   - A company everyone thinks is dying that shows subtle signs of recovery
+   - A company everyone thinks is fine but showing early cracks
+   - State your contrarian thesis and what specific evidence supports it
+
+7. FOOTNOTE MINING
+   - Critical disclosures often hide in footnotes: related party deals, off-balance-sheet
+     obligations, contingent liabilities, revenue recognition changes, lease commitments
+   - Changes in accounting policies that affect comparability
+   - Subsequent events (Note: filed after period end — most recent information available)
+
+DEEP QUALITATIVE ANALYSIS:
+1. MANAGEMENT AUTHENTICITY
+   - Does forensic data CONFIRM or CONTRADICT management's narrative?
+   - Are they getting more or less specific over time?
+   - Is guidance conservative (sandbagging) or aggressive?
+
+2. COMPETITIVE POSITION
+   - What's the actual moat (if any)?
+   - Pricing power evidence in the language?
+
+3. CAPITAL ALLOCATION QUALITY
+   - Are they investing at good returns?
+   - Buyback timing and discipline
+
+4. HIDDEN STRENGTHS
+   - Understated positives buried in footnotes
+   - New positive language that wasn't in prior filing
+   - Removed risk factors suggesting resolved concerns
+
+5. SUBTLE RED FLAGS
+   - New hedging or blame language
+   - Decreased specificity (hiding something?)
+   - Related party transactions
+   - Revenue recognition nuances
+
+Respond with JSON (CRITICAL FIELDS FIRST — these must appear early in your response):
+{{
+  "ticker": "{ticker}",
+  "final_gem_score": 1-100,
+  "conviction_level": "high|medium|low",
+  "recommendation": "strong_buy|buy|hold|avoid",
+  "one_liner": "One sentence pitch referencing specific evidence",
+  "insider_signal": {{
+    "assessment": "1-2 sentences interpreting insider activity in context of the filing",
+    "confirms_thesis": true/false,
+    "key_observation": "most important insider activity finding"
+  }},
+  "financial_trajectory": {{
+    "assessment": "1-2 sentences interpreting financial inflection data",
+    "revenue_momentum": "accelerating|stable|decelerating|declining",
+    "profitability_trajectory": "improving|stable|worsening",
+    "key_inflection": "most significant financial inflection detected (or 'none')",
+    "dilution_risk": "none|low|moderate|high"
+  }},
+  "investment_thesis": {{
+    "bull_case": "2 sentences grounded in specific forensic, insider, AND financial evidence",
+    "bear_case": "2 sentences grounded in specific forensic, insider, AND financial evidence",
+    "key_risk": "what could go wrong"
+  }},
+  "turnaround_assessment": {{
+    "is_turnaround": true/false,
+    "turnaround_phase": "no_turnaround|early_stage|mid_cycle|inflection|post_turnaround",
+    "phase_rationale": "1-2 sentences: what evidence places it in this phase?",
+    "catalysts_genuine": true/false,
+    "genuineness_evidence": "1-2 sentences: are margin/cash/debt ACTUALLY improving, or just talk?",
+    "catalyst_stacking_count": 0-8,
+    "top_catalysts": [
+      {{
+        "event": "specific catalyst description",
+        "category": "cost_restructuring|management_change|debt_restructuring|margin_inflection|asset_monetization|working_capital|ownership_change|going_concern",
+        "timeline": "Q2 2026 or 'in_progress' or 'completed'",
+        "probability": "high|medium|low",
+        "magnitude": "very_high|high|medium|low",
+        "price_asymmetry": "1 sentence: is upside or downside larger?"
+      }}
+    ],
+    "insider_confirms_turnaround": true/false/null,
+    "overall_turnaround_conviction": "high|medium|low|none"
+  }},
+  "opus_deep_signals": {{
+    "narrative_vs_numbers": {{
+      "confirmed_claims": [{{"claim": "...", "evidence": "..."}}],
+      "contradicted_claims": [{{"claim": "...", "contradiction": "..."}}],
+      "unverifiable_claims": ["..."]
+    }},
+    "critical_omissions": [
+      {{"expected_topic": "...", "why_missing_matters": "...", "signal": "bullish|bearish|neutral"}}
+    ],
+    "information_asymmetry": {{
+      "signals": [{{"observation": "...", "what_mgmt_likely_knows": "...", "direction": "bullish|bearish"}}],
+      "asymmetry_level": "high|medium|low|none"
+    }},
+    "second_order_implications": [
+      {{"observation": "...", "implication": "...", "price_impact": "...", "conviction": "high|medium|low"}}
+    ],
+    "language_evolution": {{
+      "hedging_trend": "increasing|stable|decreasing",
+      "specificity_trend": "increasing|stable|decreasing",
+      "confidence_trend": "increasing|stable|decreasing",
+      "key_language_shifts": ["specific word/phrase changes"]
+    }},
+    "contrarian_thesis": {{
+      "consensus_view": "what the market likely thinks",
+      "contrarian_view": "why consensus might be wrong",
+      "edge_source": "what specific evidence supports the contrarian view",
+      "conviction": "high|medium|low"
+    }},
+    "non_obvious_catalysts": [
+      {{"catalyst": "...", "timeline": "...", "probability": "high|medium|low", "why_others_miss_it": "..."}}
+    ],
+    "overall_edge_assessment": "1-2 sentences: what is the single most important non-obvious insight from this filing?"
+  }},
+  "deep_analysis": {{
+    "management_authenticity": {{
+      "score": 1-10,
+      "genuine_confidence_level": "high|medium|low",
+      "guidance_style": "conservative|balanced|aggressive",
+      "forensic_confirmation": "confirmed|mixed|contradicted",
+      "evidence": ["quote1"],
+      "assessment": "1-2 sentences"
+    }},
+    "competitive_position": {{
+      "score": 1-10,
+      "moat_type": "none|weak|moderate|strong",
+      "share_trend": "gaining|stable|losing",
+      "evidence": ["quote1"],
+      "assessment": "1-2 sentences"
+    }},
+    "capital_allocation": {{
+      "score": 1-10,
+      "quality": "poor|mediocre|good|excellent",
+      "evidence": ["quote1"],
+      "assessment": "1-2 sentences"
+    }},
+    "hidden_strengths": [
+      {{"finding": "...", "significance": "high|medium|low", "evidence": "..."}}
+    ],
+    "subtle_red_flags": [
+      {{"finding": "...", "severity": "high|medium|low", "evidence": "..."}}
+    ]
+  }},
+  "filing_diff_insights": {{
+    "tone_shift": "improving|stable|deteriorating",
+    "key_changes": ["change 1", "change 2"],
+    "what_they_stopped_saying": ["removed topic 1"],
+    "what_they_started_saying": ["new topic 1"],
+    "red_flag_changes": ["concerning change"],
+    "positive_changes": ["encouraging change"]
+  }},
+  "research_signals_assessment": {{
+    "overall_interpretation": "1-2 sentences: do the research signals above CONFIRM or CONTRADICT your qualitative analysis? Call out any key disagreements.",
+    "research_confirms_thesis": true/false
+  }}
+}}
+
+{forensic_data}
+
+{insider_data}
+
+{inflection_data}
+
+{research_signals_data}
+
+{catalyst_data}
+
+FILING ({form_type}) for {ticker} - {company_name}:
+{filing_text}"""
+
+
+# Opus-specific deep analysis instructions (included in T2 bundles for Claude Code analysis)
+# TODO: This is a third copy of the opus-specific instructions (also in TIER2_OPUS_DEEP_ANALYSIS_PROMPT).
+# Refactor to use a single source: extract shared opus instructions into a constant and compose both from it.
+OPUS_DEEP_ANALYSIS_INSTRUCTIONS = """OPUS-LEVEL DEEP SIGNAL ANALYSIS:
+You are the most capable reasoning model available. Your edge is finding what
+surface-level analysis misses. For EVERY filing, perform these additional analyses:
+
+1. NARRATIVE vs. NUMBERS CROSS-CHECK
+   - For each material claim in MD&A, verify against the financial data provided
+   - "Strong cash generation" -> check operating cash flow. Positive or negative?
+   - "Margin expansion" -> check if gross/operating margins actually improved
+   - "Revenue growth" -> organic or acquisition-driven? One-time or recurring?
+   - Flag EVERY claim the numbers don't support. This is where alpha lives.
+
+2. OMISSION ANALYSIS — What's NOT Being Said
+   - What SHOULD be discussed given the industry/business, but isn't mentioned?
+   - If prior filing discussed a key initiative, is there a progress update? Silence = failure.
+   - If a competitor is dominating, does management acknowledge it? Denial = risk.
+   - If the macro environment changed, did the risk factors update? Stale risks = lazy management.
+   - Omissions are often more informative than what IS said.
+
+3. INFORMATION ASYMMETRY DETECTION
+   - Where does management have information the market likely doesn't?
+   - New contract/partnership language implying a signed but unannounced deal
+   - Capacity expansion + hiring language suggesting demand visibility
+   - Unusually conservative guidance when business metrics are improving (sandbagging = bullish)
+   - Unusual caution around a segment that's outperforming (managing expectations for upside surprise)
+
+4. SECOND-ORDER IMPLICATIONS — If X Then Y
+   - Debt refinancing at lower rates -> improved cash flow -> potential for buybacks or M&A
+   - New restructuring advisor hired -> board likely evaluating strategic alternatives
+   - Auditor change -> could be accounting concerns OR new management cleaning house
+   - CFO departure + insider buying by CEO -> CEO knows something CFO didn't agree with
+   - Each implication should state what it means for the stock price
+
+5. LANGUAGE EVOLUTION PATTERNS (requires prior filing diff)
+   - Track hedging direction: "will" -> "expect" -> "may" = progressive deterioration
+   - Track specificity: vague -> specific = growing confidence; specific -> vague = hiding
+   - Track tone: defensive -> neutral -> confident = turnaround taking hold
+   - One-filing changes are noise. Multi-filing trends are signal.
+
+6. CONTRARIAN SIGNAL DETECTION
+   - What does consensus likely think about this stock? (The obvious read)
+   - Where might consensus be WRONG?
+   - The highest-alpha microcap opportunities are non-consensus correct calls
+   - A company everyone thinks is dying that shows subtle signs of recovery
+   - A company everyone thinks is fine but showing early cracks
+   - State your contrarian thesis and what specific evidence supports it
+
+7. FOOTNOTE MINING
+   - Critical disclosures often hide in footnotes: related party deals, off-balance-sheet
+     obligations, contingent liabilities, revenue recognition changes, lease commitments
+   - Changes in accounting policies that affect comparability
+   - Subsequent events (Note: filed after period end — most recent information available)
+
+Include an "opus_deep_signals" section in your JSON output with:
+- narrative_vs_numbers: confirmed_claims, contradicted_claims, unverifiable_claims
+- critical_omissions: expected_topic, why_missing_matters, signal (bullish/bearish/neutral)
+- information_asymmetry: signals with observation/what_mgmt_likely_knows/direction, asymmetry_level
+- second_order_implications: observation, implication, price_impact, conviction
+- language_evolution: hedging_trend, specificity_trend, confidence_trend, key_language_shifts
+- contrarian_thesis: consensus_view, contrarian_view, edge_source, conviction
+- non_obvious_catalysts: catalyst, timeline, probability, why_others_miss_it
+- overall_edge_assessment: 1-2 sentences on the single most important non-obvious insight"""
+
+
+# ============================================================================
 # ANALYSIS FUNCTIONS
 # ============================================================================
 
@@ -1085,11 +1484,10 @@ def analyze_filing_tier1(
         scores = [d.get("score", 5) for d in result["dimensions"].values()]
         result["composite_score"] = round(sum(scores) / len(scores) * 10, 1) if scores else 50
 
-    # Normalize composite_score to 0-100 scale
-    # LLM sometimes returns 1-10 despite being asked for 1-100
+    # Warn if LLM returns score in 0-10 range instead of 0-100
     cs = result.get("composite_score")
     if cs is not None and cs <= 10:
-        result["composite_score"] = round(cs * 10, 1)
+        logger.warning("LLM returned score in 0-10 range: %s", cs)
 
     return result
 
@@ -1120,6 +1518,9 @@ def analyze_trajectory_tier1(
 
     raw = _call_llm(prompt, SYSTEM_PROMPT_GEM_FINDER, model)
     result = _parse_json_response(raw)
+
+    if not result:
+        logger.warning("Failed to parse tier1 result for %s", ticker)
 
     if result:
         result["analysis_tier"] = 1
@@ -1258,6 +1659,7 @@ Focus analysis on:
 Focus on whether the governance picture supports or blocks a turnaround catalyst.
 """
 
+    # NOTE: Filing text is user-controlled content from SEC EDGAR. Prompt injection risk documented.
     prompt = TIER2_DEEP_ANALYSIS_PROMPT.format(
         ticker=ticker,
         company_name=company_name,
@@ -1269,6 +1671,11 @@ Focus on whether the governance picture supports or blocks a turnaround catalyst
         research_signals_data=research_signals_data,
         catalyst_data=catalyst_data,
     )
+
+    # Prompt size validation — warn if excessively large
+    estimated_tokens = len(prompt) // 4
+    if estimated_tokens > 200000:
+        logger.warning("Prompt exceeds 200K estimated tokens: %d", estimated_tokens)
 
     raw = _call_llm(prompt, SYSTEM_PROMPT_DEEP_ANALYSIS, model, max_tokens=8192,
                     thinking_budget=thinking_budget, effort=effort)
@@ -1288,10 +1695,10 @@ Focus on whether the governance picture supports or blocks a turnaround catalyst
     if effort:
         result["effort_level"] = effort
 
-    # Normalize final_gem_score to 0-100 scale (safety check)
+    # Warn if LLM returns score in 0-10 range instead of 0-100
     fgs = result.get("final_gem_score")
     if fgs is not None and fgs <= 10:
-        result["final_gem_score"] = round(fgs * 10)
+        logger.warning("LLM returned score in 0-10 range: %s", fgs)
 
     return result
 
@@ -1353,8 +1760,6 @@ def run_tiered_analysis(
                 t1_result["accession_number"] = filing.get("accession_number", "")
                 results["tier1_results"].append(t1_result)
                 results["stats"]["tier1_completed"] += 1
-            else:
-                results["errors"].append(f"{ticker}: Tier 1 analysis returned None")
         except Exception as e:
             results["errors"].append(f"{ticker}: Tier 1 error - {str(e)}")
             logger.error(f"Tier 1 error for {ticker}: {e}")
@@ -1369,20 +1774,24 @@ def run_tiered_analysis(
         reverse=True,
     )
 
-    tier2_count = max(1, int(len(tier1_sorted) * tier2_percentile))
+    tier2_count = max(0, int(len(tier1_sorted) * tier2_percentile))
     tier2_candidates = tier1_sorted[:tier2_count]
     results["stats"]["tier2_eligible"] = tier2_count
 
-    # Build lookup for filing text
-    filing_lookup = {f.get("ticker"): f for f in filings}
+    # Build lookup for filing text by accession_number to avoid collisions
+    filing_lookup = {f.get("accession_number"): f for f in filings}
 
     # ---- TIER 2: Deep analysis on top candidates ----
+    if tier2_count == 0:
+        logger.info("No filings eligible for Tier 2 analysis (count=0)")
+        return results
+
     if progress_callback:
         progress_callback(0, tier2_count, "", 2, "Starting Tier 2 deep analysis...")
 
     for i, t1_result in enumerate(tier2_candidates):
         ticker = t1_result.get("ticker", "UNKNOWN")
-        filing = filing_lookup.get(ticker, {})
+        filing = filing_lookup.get(t1_result.get("accession_number"), {})
 
         try:
             t2_result = analyze_filing_tier2(
@@ -1400,8 +1809,6 @@ def run_tiered_analysis(
                 t2_result["accession_number"] = t1_result.get("accession_number", "")
                 results["tier2_results"].append(t2_result)
                 results["stats"]["tier2_completed"] += 1
-            else:
-                results["errors"].append(f"{ticker}: Tier 2 analysis returned None")
         except Exception as e:
             results["errors"].append(f"{ticker}: Tier 2 error - {str(e)}")
             logger.error(f"Tier 2 error for {ticker}: {e}")
@@ -1457,8 +1864,13 @@ def check_api_status() -> Dict[str, Any]:
 
 def estimate_cost(num_filings: int, tier2_percentile: float = 0.25,
                   tier2_model: str = "", effort: str = "") -> Dict[str, Any]:
-    """Estimate cost for analyzing filings including insider + inflection data."""
-    tier2_count = int(num_filings * tier2_percentile)
+    """Estimate cost for analyzing filings including insider + inflection data.
+
+    Note: Token counts (t1_avg_input, t1_avg_output, t2_avg_input, t2_avg_output)
+    are rough estimates based on typical filing sizes and response lengths.
+    Actual costs may vary significantly depending on filing length and model verbosity.
+    """
+    tier2_count = max(1, int(num_filings * tier2_percentile))
     t2_model_name = tier2_model if tier2_model in MODELS else DEFAULT_TIER2_MODEL
 
     # ---- Tier 1: GPT-4o-mini screening ----
@@ -1545,7 +1957,12 @@ def is_llm_available() -> bool:
 
 
 def llm_analyze_sentiment(current_text: str, prior_text: Optional[str] = None) -> Optional[Dict]:
-    """Legacy function - now uses Tier 1 analysis."""
+    """Legacy function - now uses Tier 1 analysis.
+
+    .. deprecated::
+        Use :func:`analyze_filing_tier1` directly instead. This wrapper adds overhead
+        by converting results to an outdated format and may be removed in a future version.
+    """
     try:
         result = analyze_filing_tier1(
             ticker="UNKNOWN",
@@ -1577,7 +1994,12 @@ def llm_analyze_sentiment(current_text: str, prior_text: Optional[str] = None) -
 
 
 def llm_analyze_flags(current_text: str, prior_text: Optional[str] = None) -> Optional[Dict]:
-    """Legacy function - now uses Tier 1 analysis."""
+    """Legacy function - now uses Tier 1 analysis.
+
+    .. deprecated::
+        Use :func:`analyze_filing_tier1` directly instead. This wrapper adds overhead
+        by converting results to an outdated format and may be removed in a future version.
+    """
     try:
         result = analyze_filing_tier1(
             ticker="UNKNOWN",

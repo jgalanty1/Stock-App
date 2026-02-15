@@ -21,8 +21,7 @@ have outsized price impact vs. large caps.
 
 import re
 import logging
-from typing import Dict, Any, Optional, List, Tuple
-from collections import defaultdict
+from typing import Dict, Any, Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -997,48 +996,53 @@ def extract_all_catalysts(text: str, prior_text: str = None) -> Dict[str, Any]:
         if going_concern.get('resolved_signals'):
             # Current filing explicitly says GC resolved
             gc_direction = 'removed'
-            all_catalysts.append({
-                'category': 'going_concern',
-                'subcategory': 'removed_vs_prior',
-                'description': 'Going concern language RESOLVED in current filing — existential risk removed',
-                'bullish_if': True,
-                'magnitude': 'very_high',
-                'evidence': going_concern['resolved_signals'][:2],
-            })
+            if not any(c.get('subcategory') == 'removed_vs_prior' for c in all_catalysts):
+                all_catalysts.append({
+                    'category': 'going_concern',
+                    'subcategory': 'removed_vs_prior',
+                    'description': 'Going concern language RESOLVED in current filing — existential risk removed',
+                    'bullish_if': True,
+                    'magnitude': 'very_high',
+                    'evidence': going_concern['resolved_signals'][:2],
+                })
         elif going_concern.get('new_concern_signals'):
             gc_direction = 'added'
-            all_catalysts.append({
-                'category': 'going_concern',
-                'subcategory': 'added_vs_prior',
-                'description': 'Going concern doubt raised — new existential risk',
-                'bullish_if': False,
-                'magnitude': 'very_high',
-                'evidence': going_concern['new_concern_signals'][:2],
-            })
-        elif prior_text:
-            # Fallback: compare presence in prior vs current
+            if not any(c.get('subcategory') == 'added_vs_prior' for c in all_catalysts):
+                all_catalysts.append({
+                    'category': 'going_concern',
+                    'subcategory': 'added_vs_prior',
+                    'description': 'Going concern doubt raised — new existential risk',
+                    'bullish_if': False,
+                    'magnitude': 'very_high',
+                    'evidence': going_concern['new_concern_signals'][:2],
+                })
+        if prior_text and gc_direction is None:
+            # Fallback: compare presence in prior vs current when direction
+            # was not determined from resolved/new signals above
             prior_gc = _find_sentences(prior_text, _GOING_CONCERN, 200)
             cur_gc = going_concern.get('going_concern_mentions', [])
             if prior_gc and not cur_gc:
                 gc_direction = 'removed'
-                all_catalysts.append({
-                    'category': 'going_concern',
-                    'subcategory': 'removed_vs_prior',
-                    'description': 'Going concern language REMOVED since prior filing — existential risk resolved',
-                    'bullish_if': True,
-                    'magnitude': 'very_high',
-                    'evidence': ['Prior filing had going concern language. Current filing does not.'],
-                })
+                if not any(c.get('subcategory') == 'removed_vs_prior' for c in all_catalysts):
+                    all_catalysts.append({
+                        'category': 'going_concern',
+                        'subcategory': 'removed_vs_prior',
+                        'description': 'Going concern language REMOVED since prior filing — existential risk resolved',
+                        'bullish_if': True,
+                        'magnitude': 'very_high',
+                        'evidence': ['Prior filing had going concern language. Current filing does not.'],
+                    })
             elif not prior_gc and cur_gc:
                 gc_direction = 'added'
-                all_catalysts.append({
-                    'category': 'going_concern',
-                    'subcategory': 'added_vs_prior',
-                    'description': 'Going concern language ADDED since prior filing — new existential risk',
-                    'bullish_if': False,
-                    'magnitude': 'very_high',
-                    'evidence': ['Prior filing had no going concern language. Current filing does.'],
-                })
+                if not any(c.get('subcategory') == 'added_vs_prior' for c in all_catalysts):
+                    all_catalysts.append({
+                        'category': 'going_concern',
+                        'subcategory': 'added_vs_prior',
+                        'description': 'Going concern language ADDED since prior filing — new existential risk',
+                        'bullish_if': False,
+                        'magnitude': 'very_high',
+                        'evidence': ['Prior filing had no going concern language. Current filing does.'],
+                    })
 
     # Score catalysts
     turnaround_score = 50  # neutral baseline

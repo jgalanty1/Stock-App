@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 MONITOR_STATE_FILE = "monitor_state.json"
 MONITOR_LOG_FILE = "monitor_log.json"
 
-# EDGAR EFTS full-text search endpoint (free, no key needed)
+# EDGAR EFTS endpoint — free, no key needed (see Strategy in module docstring)
 EFTS_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
 
 
@@ -53,7 +53,7 @@ def search_new_filings_efts(start_date: str, end_date: str,
     This is MUCH more efficient than polling per-company — one request
     gets all filings filed that day.
     """
-    from scraper import _get_session, _safe_request, SEC_REQUEST_DELAY
+    from scraper import _get_session, _safe_request, _edgar_limiter
 
     if session is None:
         session = _get_session()
@@ -78,7 +78,7 @@ def search_new_filings_efts(start_date: str, end_date: str,
         }
 
         data = _safe_request(session, EFTS_SEARCH_URL, params=params,
-                             delay=SEC_REQUEST_DELAY)
+                             limiter=_edgar_limiter)
 
         if not data or not isinstance(data, dict):
             logger.warning(f"EFTS search returned no data (from={page_from})")
@@ -149,7 +149,7 @@ def resolve_filing_urls(filings: List[Dict], session=None) -> List[Dict]:
     For each matched filing, query EDGAR submissions API to get
     the download URL for the primary document.
     """
-    from scraper import _get_session, _safe_request, SEC_REQUEST_DELAY
+    from scraper import _get_session, _safe_request, _edgar_limiter
 
     if session is None:
         session = _get_session()
@@ -162,7 +162,7 @@ def resolve_filing_urls(filings: List[Dict], session=None) -> List[Dict]:
 
     for cik, cik_filings in by_cik.items():
         url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-        data = _safe_request(session, url, delay=SEC_REQUEST_DELAY)
+        data = _safe_request(session, url, limiter=_edgar_limiter)
 
         if not data:
             logger.warning(f"Could not fetch submissions for CIK {cik}")
@@ -238,10 +238,16 @@ class MonitorState:
         return []
 
     def save(self):
-        with open(self.state_path, "w") as f:
+        # Atomic write: write to tmp file then rename
+        tmp_state = self.state_path + ".tmp"
+        with open(tmp_state, "w") as f:
             json.dump(self.state, f, indent=2)
-        with open(self.log_path, "w") as f:
+        os.replace(tmp_state, self.state_path)
+
+        tmp_log = self.log_path + ".tmp"
+        with open(tmp_log, "w") as f:
             json.dump(self.log[-90:], f, indent=2)
+        os.replace(tmp_log, self.log_path)
 
     def add_log_entry(self, entry: Dict):
         entry["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -313,6 +319,11 @@ def run_daily_check(scraper, monitor_state: MonitorState,
     # 4) Download (skip duplicates)
     existing_accessions = {f.get("accession_number") for f in scraper.filings_index}
 
+    if not hasattr(scraper, 'filings_dir'):
+        summary["status"] = "error"
+        summary["errors"].append("Scraper missing filings_dir attribute.")
+        return summary
+
     for filing in resolved:
         accession = filing.get("accession_number", "")
         if accession in existing_accessions:
@@ -341,6 +352,7 @@ def run_daily_check(scraper, monitor_state: MonitorState,
                 f"Download failed: {filing.get('ticker', '')} {filing.get('form_type', '')}"
             )
 
+    # NOTE: Coupling to private method — scraper has no public save API
     scraper._save_state()
 
     # 5) Auto-analyze if enabled
@@ -464,6 +476,7 @@ class DailyScheduler:
         self._stop_event = threading.Event()
         self._running = False
         self._last_check_result: Optional[Dict] = None
+        self._scheduler_lock = threading.Lock()
 
     @property
     def is_running(self) -> bool:
@@ -493,14 +506,15 @@ class DailyScheduler:
 
     def run_now(self) -> Dict:
         """Trigger an immediate check."""
-        result = run_daily_check(
-            self.scraper,
-            self.monitor_state,
-            auto_analyze=self.monitor_state.state.get("auto_analyze", False),
-            use_llm=self.monitor_state.state.get("use_llm_for_auto", False),
-        )
-        self._last_check_result = result
-        return result
+        with self._scheduler_lock:
+            result = run_daily_check(
+                self.scraper,
+                self.monitor_state,
+                auto_analyze=self.monitor_state.state.get("auto_analyze", False),
+                use_llm=self.monitor_state.state.get("use_llm_for_auto", False),
+            )
+            self._last_check_result = result
+            return result
 
     def _run_loop(self):
         logger.info(f"Scheduler loop started — run time: "
@@ -525,19 +539,20 @@ class DailyScheduler:
 
                     if not last_run or not last_run.startswith(today):
                         logger.info(f"Scheduled run at {now.strftime('%H:%M')}")
-                        try:
-                            result = run_daily_check(
-                                self.scraper,
-                                self.monitor_state,
-                                auto_analyze=self.monitor_state.state.get("auto_analyze", False),
-                                use_llm=self.monitor_state.state.get("use_llm_for_auto", False),
-                            )
-                            self._last_check_result = result
-                        except Exception as e:
-                            logger.error(f"Daily check failed: {e}")
-                            self.monitor_state.state["last_run_status"] = "error"
-                            self.monitor_state.state["last_run_message"] = str(e)
-                            self.monitor_state.save()
+                        with self._scheduler_lock:
+                            try:
+                                result = run_daily_check(
+                                    self.scraper,
+                                    self.monitor_state,
+                                    auto_analyze=self.monitor_state.state.get("auto_analyze", False),
+                                    use_llm=self.monitor_state.state.get("use_llm_for_auto", False),
+                                )
+                                self._last_check_result = result
+                            except Exception as e:
+                                logger.error(f"Daily check failed: {e}")
+                                self.monitor_state.state["last_run_status"] = "error"
+                                self.monitor_state.state["last_run_message"] = str(e)
+                                self.monitor_state.save()
 
             except Exception as e:
                 logger.error(f"Scheduler loop error: {e}")

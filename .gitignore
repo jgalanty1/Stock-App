@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Data directories (large, generated)
+scraper_data/
+sec_data/
+results/
+prepared/
+
+# Config with API keys
+config.json
+
+# Backups and archives
+*.zip
+
+# Temporary/generated files
+process_jushf_t1.py

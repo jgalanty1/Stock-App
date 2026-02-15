@@ -31,6 +31,7 @@ Composite "research_signal_score" uses evidence-strength-weighted average.
 import re
 import math
 import logging
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Tuple
 from collections import Counter
 
@@ -40,23 +41,27 @@ logger = logging.getLogger(__name__)
 # TEXT SIMILARITY UTILITIES
 # ============================================================================
 
+_STOPWORDS = {
+    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+    'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
+    'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+    'would', 'could', 'should', 'may', 'might', 'shall', 'can', 'not',
+    'no', 'nor', 'this', 'that', 'these', 'those', 'it', 'its', 'we',
+    'our', 'us', 'they', 'their', 'them', 'he', 'she', 'his', 'her',
+    'i', 'me', 'my', 'you', 'your', 'which', 'who', 'whom', 'what',
+    'when', 'where', 'how', 'than', 'then', 'so', 'if', 'such', 'each',
+    'all', 'any', 'both', 'more', 'other', 'some', 'only', 'also',
+    'into', 'over', 'after', 'before', 'between', 'under', 'above',
+    'very', 'just', 'about', 'up', 'out', 'off', 'down', 'through',
+}
+
+_WORD_RE = re.compile(r'\b[a-z]{2,}\b')
+
+
 def _tokenize(text: str) -> List[str]:
     """Simple word tokenization, lowercase, remove stopwords."""
-    STOPWORDS = {
-        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-        'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
-        'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
-        'would', 'could', 'should', 'may', 'might', 'shall', 'can', 'not',
-        'no', 'nor', 'this', 'that', 'these', 'those', 'it', 'its', 'we',
-        'our', 'us', 'they', 'their', 'them', 'he', 'she', 'his', 'her',
-        'i', 'me', 'my', 'you', 'your', 'which', 'who', 'whom', 'what',
-        'when', 'where', 'how', 'than', 'then', 'so', 'if', 'such', 'each',
-        'all', 'any', 'both', 'more', 'other', 'some', 'only', 'also',
-        'into', 'over', 'after', 'before', 'between', 'under', 'above',
-        'very', 'just', 'about', 'up', 'out', 'off', 'down', 'through',
-    }
-    words = re.findall(r'\b[a-z]{2,}\b', text.lower())
-    return [w for w in words if w not in STOPWORDS]
+    words = _WORD_RE.findall(text.lower())
+    return [w for w in words if w not in _STOPWORDS]
 
 
 def _cosine_similarity(tokens_a: List[str], tokens_b: List[str]) -> float:
@@ -101,22 +106,27 @@ def _word_count_ratio(tokens_a: List[str], tokens_b: List[str]) -> float:
 # SECTION EXTRACTION
 # ============================================================================
 
-LEGAL_PROCEEDINGS_HEADER = re.compile(
+LEGAL_PROCEEDINGS_HEADER_RE = re.compile(
     r'(?:item\s*(?:1|3)\.?\s*legal\s*proceedings'
     r'|legal\s*proceedings)',
     re.IGNORECASE,
 )
 
-MDA_HEADER = re.compile(
+MDA_HEADER_RE = re.compile(
     r"(?:item\s*(?:2|7)\.?\s*management'?s?\s*discussion|"
     r"management'?s?\s*discussion\s*and\s*analysis)",
     re.IGNORECASE,
 )
 
-RISK_FACTOR_HEADER = re.compile(
+RISK_FACTOR_HEADER_RE = re.compile(
     r'(?:item\s*1a\.?\s*risk\s*factors|risk\s*factors)',
     re.IGNORECASE,
 )
+
+# Keep backward-compatible aliases
+LEGAL_PROCEEDINGS_HEADER = LEGAL_PROCEEDINGS_HEADER_RE
+MDA_HEADER = MDA_HEADER_RE
+RISK_FACTOR_HEADER = RISK_FACTOR_HEADER_RE
 
 
 def _extract_section(text: str, header_pattern: re.Pattern,
@@ -132,9 +142,10 @@ def _extract_section(text: str, header_pattern: re.Pattern,
 
     start = match.start()
     # Find the next major section header
-    next_item = re.search(r'\bitem\s+\d+[a-z]?\.', text[start + 100:], re.IGNORECASE)
+    skip = len(match.group())
+    next_item = re.search(r'\bitem\s+\d+[a-z]?\.', text[start + skip:], re.IGNORECASE)
     if next_item:
-        end = start + 100 + next_item.start()
+        end = start + skip + next_item.start()
     else:
         end = start + max_chars
 
@@ -198,6 +209,10 @@ SIGNAL_CITATIONS = {
 # Top terms from each category (representative subset for speed)
 # ============================================================================
 
+# NOTE: LM word sets intentionally overlap across categories (e.g., 'volatile' appears
+# in both LM_NEGATIVE and LM_UNCERTAINTY, 'litigation' in LM_NEGATIVE and LM_LITIGIOUS).
+# This mirrors the original Loughran-McDonald dictionary where words can carry multiple
+# connotations. Each set is used independently for its respective signal dimension.
 LM_NEGATIVE = {
     'abandon', 'abandoned', 'abandoning', 'abandonment', 'abrupt', 'absence',
     'adverse', 'adversely', 'against', 'aggravate', 'allegation', 'allegations',
@@ -285,7 +300,7 @@ LM_UNCERTAINTY = {
     'approximately', 'assumption', 'assumptions', 'believe', 'believed',
     'believes', 'conceivable', 'conditional', 'confuse', 'contingency',
     'contingent', 'could', 'crossroad', 'depend', 'depended', 'depending',
-    'depends', 'destabilize', 'deviate', 'doubt', 'doubtful', 'doubt',
+    'depends', 'destabilize', 'deviate', 'doubt', 'doubtful', 'doubts',
     'dubious', 'equivocal', 'estimate', 'estimated', 'estimates',
     'eventually', 'expect', 'expectation', 'expectations', 'expose',
     'exposed', 'exposure', 'fluctuate', 'fluctuated', 'fluctuation',
@@ -338,6 +353,15 @@ LM_LITIGIOUS = {
 }
 
 
+# ============================================================================
+# SIGNAL FUNCTIONS
+# Note: Signals are grouped by dependency, not by number.
+# Order: 1 (MD&A) → 3 (Risk) → 6 (Legal) → 8 (Timeliness) →
+#        2 (Sentiment) → 4 (Positive Sim) → 5 (Sentiment Delta) →
+#        7 (Uncertainty) → 9 (Complexity) → 10 (Insider)
+# ============================================================================
+
+# --- Signal 1: MD&A Similarity ---
 # ============================================================================
 # SIGNAL 1: MD&A SIMILARITY (Weight: 20%)
 # ============================================================================
@@ -508,7 +532,7 @@ def compute_risk_factor_signal(current_text: str, prior_text: str) -> Dict[str, 
     # Count distinct risk factor headings
     def _count_risks(section):
         titles = re.findall(
-            r'(?:^|\n)\s*([A-Z][A-Za-z\s,\'-]{10,80}?)(?:\.|—|\n)',
+            r'(?:^|\n)\s*([A-Z][A-Za-z ,\'\-]{10,80})(?:\.|—|\n)',
             section
         )
         return [t.strip() for t in titles if len(t.strip()) > 15]
@@ -645,15 +669,21 @@ def compute_legal_proceedings_signal(current_text: str, prior_text: str) -> Dict
     else:
         cosine = 0.8  # assume stable for very short sections
 
-    # Detect new legal entity names (capitalized multi-word phrases in current not in prior)
-    cur_entities = set(re.findall(r'[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4}', current_legal))
-    pri_entities = set(re.findall(r'[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4}', prior_legal))
+    # Detect new legal entity names (capitalized multi-word phrases, min 8 chars, in current not in prior)
+    _entity_re = re.compile(r'[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4}')
+    cur_entities = set(e for e in _entity_re.findall(current_legal) if len(e) >= 8)
+    pri_entities = set(e for e in _entity_re.findall(prior_legal) if len(e) >= 8)
     new_entities = list(cur_entities - pri_entities)[:5]
     result['new_legal_entities'] = new_entities
 
-    # Detect new dollar amounts
-    cur_amounts = set(re.findall(r'\$[\d,.]+\s*(?:million|billion|thousand)?', current_legal, re.IGNORECASE))
-    pri_amounts = set(re.findall(r'\$[\d,.]+\s*(?:million|billion|thousand)?', prior_legal, re.IGNORECASE))
+    # Detect new dollar amounts (matches $10.5M, $X million, USD X million)
+    _dollar_re = re.compile(
+        r'(?:\$[\d,.]+\s*[MBKmb]?(?:illion|housand)?'
+        r'|(?:USD|U\.S\.\s*dollars?)\s+[\d,.]+\s*(?:million|billion|thousand)?)',
+        re.IGNORECASE
+    )
+    cur_amounts = set(_dollar_re.findall(current_legal))
+    pri_amounts = set(_dollar_re.findall(prior_legal))
     new_amounts = list(cur_amounts - pri_amounts)[:5]
     result['new_dollar_amounts'] = new_amounts
 
@@ -708,8 +738,7 @@ def compute_legal_proceedings_signal(current_text: str, prior_text: str) -> Dict
 # ============================================================================
 
 def compute_filing_timeliness_signal(filing_date: str, form_type: str,
-                                      period_end: str = None,
-                                      filing_count_for_ticker: int = 1) -> Dict[str, Any]:
+                                      period_end: str = None) -> Dict[str, Any]:
     """
     Score filing timeliness.
 
@@ -718,8 +747,6 @@ def compute_filing_timeliness_signal(filing_date: str, form_type: str,
 
     Returns score 0-100 where higher = timelier filing.
     """
-    from datetime import datetime
-
     result = {
         'signal': 'filing_timeliness',
         'has_data': False,
@@ -741,11 +768,9 @@ def compute_filing_timeliness_signal(filing_date: str, form_type: str,
             if form_type in ("10-K", "10-K/A"):
                 # Most 10-Ks filed ~60-90 days after fiscal year end
                 # Estimate: period_end ≈ filing_date - 75 days
-                from datetime import timedelta
                 period = filed - timedelta(days=75)
                 period_end = period.strftime("%Y-%m-%d")
             elif form_type in ("10-Q", "10-Q/A"):
-                from datetime import timedelta
                 period = filed - timedelta(days=40)
                 period_end = period.strftime("%Y-%m-%d")
             else:
@@ -870,7 +895,7 @@ def compute_lm_sentiment(text: str) -> Dict[str, Any]:
         return result
 
     # Tokenize entire filing
-    words = re.findall(r'\b[a-z]{2,}\b', text.lower())
+    words = _WORD_RE.findall(text.lower())
     total = len(words)
     if total < 100:
         result['interpretation'] = 'Insufficient tokens for sentiment analysis'
@@ -878,11 +903,20 @@ def compute_lm_sentiment(text: str) -> Dict[str, Any]:
 
     result['total_words'] = total
 
-    # Count category words
-    pos_count = sum(1 for w in words if w in LM_POSITIVE)
-    neg_count = sum(1 for w in words if w in LM_NEGATIVE)
-    unc_count = sum(1 for w in words if w in LM_UNCERTAINTY)
-    lit_count = sum(1 for w in words if w in LM_LITIGIOUS)
+    # Count category words — single pass over all words
+    pos_count = 0
+    neg_count = 0
+    unc_count = 0
+    lit_count = 0
+    for w in words:
+        if w in LM_POSITIVE:
+            pos_count += 1
+        if w in LM_NEGATIVE:
+            neg_count += 1
+        if w in LM_UNCERTAINTY:
+            unc_count += 1
+        if w in LM_LITIGIOUS:
+            lit_count += 1
 
     result['positive_count'] = pos_count
     result['negative_count'] = neg_count
@@ -980,22 +1014,24 @@ def compute_positive_similarity(current_text: str, prior_text: str) -> Dict[str,
 
     # Get all words, then filter to positive words and their 3-word contexts
     def _positive_context_tokens(text):
-        """Extract positive words and their surrounding context."""
-        words = re.findall(r'\b[a-z]{2,}\b', text.lower())
+        """Extract positive words and their surrounding context. Returns (context_tokens, positive_count)."""
+        words = _WORD_RE.findall(text.lower())
         positive_tokens = []
+        positive_count = 0
         for i, w in enumerate(words):
             if w in LM_POSITIVE:
+                positive_count += 1
                 # Include the positive word and 2 words on each side (context)
                 start = max(0, i - 2)
                 end = min(len(words), i + 3)
                 positive_tokens.extend(words[start:end])
-        return positive_tokens
+        return positive_tokens, positive_count
 
-    cur_pos = _positive_context_tokens(current_mda)
-    pri_pos = _positive_context_tokens(prior_mda)
+    cur_pos, cur_pos_count = _positive_context_tokens(current_mda)
+    pri_pos, pri_pos_count = _positive_context_tokens(prior_mda)
 
-    result['current_positive_count'] = sum(1 for w in re.findall(r'\b[a-z]{2,}\b', current_mda.lower()) if w in LM_POSITIVE)
-    result['prior_positive_count'] = sum(1 for w in re.findall(r'\b[a-z]{2,}\b', prior_mda.lower()) if w in LM_POSITIVE)
+    result['current_positive_count'] = cur_pos_count
+    result['prior_positive_count'] = pri_pos_count
 
     if len(cur_pos) < 20 or len(pri_pos) < 20:
         result['interpretation'] = 'Insufficient positive language for comparison'
@@ -1023,6 +1059,7 @@ def compute_positive_similarity(current_text: str, prior_text: str) -> Dict[str,
     else:
         score = max(15, 40 - (combined - 0.90) / 0.10 * 25)  # 15-40 (very similar = muted signal)
 
+    # Score is clamped to [0, 100] below
     score = max(0, min(100, round(score)))
     result['has_data'] = True
     result['score'] = score
@@ -1188,8 +1225,7 @@ def compute_uncertainty_signal(text: str) -> Dict[str, Any]:
     result['uncertainty_pct'] = round(unc_pct, 3)
 
     # Top uncertainty terms by frequency
-    from collections import Counter as C2
-    top_terms = C2(unc_words).most_common(5)
+    top_terms = Counter(unc_words).most_common(5)
     result['top_uncertainty_terms'] = [f'{term}({cnt})' for term, cnt in top_terms]
 
     # Map uncertainty percentage to INVERTED score (less uncertainty = higher score)
@@ -1259,8 +1295,8 @@ def compute_document_complexity(text: str) -> Dict[str, Any]:
     # Use MD&A section (most important per research) or first 50K chars
     focus = _extract_section(text, MDA_HEADER, 50000) or text[:50000]
 
-    # Split into sentences
-    sentences = re.split(r'[.!?]+', focus)
+    # Split into sentences (lookahead for capital letter avoids splitting on abbreviations like U.S.)
+    sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', focus)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
 
     if len(sentences) < 10:
@@ -1382,7 +1418,7 @@ def compute_insider_pattern_signal(insider_data: Optional[Dict[str, Any]] = None
         sell_txns = [t for t in transactions if t.get('type', '').lower() in ('sale', 'sell', 's')]
         buyers = len(set(t.get('insider_name', '') for t in buy_txns))
         sellers = len(set(t.get('insider_name', '') for t in sell_txns))
-        net_purch = buyers - sellers
+        net_purch = len(buy_txns) - len(sell_txns)  # Count transactions, not unique persons
         exec_buyers = sum(1 for t in buy_txns if t.get('is_executive', False) or
                          t.get('title', '').upper() in ('CEO', 'CFO', 'COO', 'CTO', 'PRESIDENT'))
         total_val = sum(t.get('value', 0) for t in buy_txns)
@@ -1445,9 +1481,156 @@ def compute_insider_pattern_signal(insider_data: Optional[Dict[str, Any]] = None
     return result
 
 
+# --- Utility / Aggregation Functions ---
 # ============================================================================
-# COMPOSITE SIGNAL
+# COMPOSITE SIGNAL & UTILITY FUNCTIONS
 # ============================================================================
+
+def detect_amendment_restatement(text: str, form_type: str = '') -> Dict[str, Any]:
+    """
+    Detect amendments and restatements in filing text.
+
+    Amendments (10-K/A, 10-Q/A) often indicate accounting problems.
+    Restatements are even more serious — they mean prior financials were wrong.
+
+    Returns:
+        {
+            'is_amendment': bool,
+            'has_restatement': bool,
+            'restatement_keywords': list,
+            'amendment_score': 0-100 (lower = more concern),
+            'signal': str
+        }
+    """
+    is_amendment = form_type.endswith('/A')
+    text_lower = text[:50000].lower() if text else ''
+
+    restatement_phrases = [
+        'restatement', 'restated', 'restate our',
+        'material weakness', 'material misstatement',
+        'error correction', 'correcting error',
+        'revised financial statements', 'revised consolidated',
+        'reclassification', 'prior period adjustment',
+        'as previously reported', 'as originally reported',
+    ]
+
+    found_phrases = [p for p in restatement_phrases if p in text_lower]
+    has_restatement = len(found_phrases) >= 2  # Multiple keywords = likely actual restatement
+
+    # Score: 50 = neutral, lower = worse
+    score = 50
+    if is_amendment:
+        score -= 15
+    if has_restatement:
+        score -= 25
+    if 'going concern' in text_lower:
+        score -= 10
+
+    score = max(0, min(100, score))
+
+    if score < 20:
+        signal = 'strong_negative'
+    elif score < 35:
+        signal = 'negative'
+    elif score < 45:
+        signal = 'slightly_negative'
+    else:
+        signal = 'neutral'
+
+    return {
+        'is_amendment': is_amendment,
+        'has_restatement': has_restatement,
+        'restatement_keywords': found_phrases,
+        'amendment_score': score,
+        'signal': signal,
+    }
+
+
+def detect_revenue_concentration(text: str) -> Dict[str, Any]:
+    """
+    Parse "major customer" / revenue concentration disclosures from filing text.
+
+    SEC requires disclosure when a single customer represents >10% of revenue.
+    High concentration = risk (customer loss = revenue cliff).
+    Growing concentration from prior filings = additional concern.
+
+    Returns:
+        {
+            'concentration_score': 0-100 (higher = more concentrated),
+            'major_customers_mentioned': int,
+            'concentration_phrases': list,
+            'signal': str
+        }
+    """
+    text_lower = text[:50000].lower() if text else ''
+    if not text_lower:
+        return {
+            'concentration_score': 0,
+            'major_customers_mentioned': 0,
+            'concentration_phrases': [],
+            'signal': 'no_data',
+        }
+
+    # Phrases indicating customer concentration
+    concentration_phrases = []
+    patterns = [
+        r'(?:one|a single|1)\s+customer\s+(?:accounted|represented|comprised)',
+        r'(?:two|three|2|3)\s+customers?\s+(?:accounted|represented|comprised)',
+        r'(?:\d+)%\s+of\s+(?:our\s+)?(?:total\s+)?(?:revenue|sales|net revenue)',
+        r'major\s+customer',
+        r'significant\s+customer',
+        r'largest\s+customer',
+        r'customer\s+concentration',
+        r'revenue\s+concentration',
+        r'(?:loss|losing)\s+(?:of\s+)?(?:a\s+)?(?:key|major|significant)\s+customer',
+        r'single\s+source\s+(?:of\s+)?revenue',
+    ]
+
+    for pat in patterns:
+        matches = re.findall(pat, text_lower)
+        concentration_phrases.extend(matches[:3])
+
+    # Extract percentage mentions near concentration language
+    pct_near_customer = []
+    for match in re.finditer(r'(\d{1,3})%\s+of\s+(?:our\s+)?(?:total\s+)?(?:revenue|sales|net\s+revenue)', text_lower):
+        try:
+            pct = int(match.group(1))
+            if 10 <= pct <= 100:
+                pct_near_customer.append(pct)
+        except ValueError:
+            pass
+
+    # Score: 0 = no concentration, 100 = extreme concentration
+    score = 0
+    n_phrases = len(concentration_phrases)
+
+    if pct_near_customer:
+        max_pct = max(pct_near_customer)
+        score = max_pct  # Direct mapping: 50% customer = score 50
+    elif n_phrases >= 3:
+        score = 60
+    elif n_phrases >= 2:
+        score = 40
+    elif n_phrases >= 1:
+        score = 20
+
+    if score >= 60:
+        signal = 'high_concentration'
+    elif score >= 30:
+        signal = 'moderate_concentration'
+    elif score > 0:
+        signal = 'low_concentration'
+    else:
+        signal = 'no_concentration_risk'
+
+    return {
+        'concentration_score': score,
+        'major_customers_mentioned': len(pct_near_customer),
+        'max_customer_pct': max(pct_near_customer) if pct_near_customer else None,
+        'concentration_phrases': concentration_phrases[:10],
+        'signal': signal,
+    }
+
 
 def compute_all_signals(current_text: str, prior_text: str = None,
                         filing_date: str = '', form_type: str = '10-K',
@@ -1478,7 +1661,17 @@ def compute_all_signals(current_text: str, prior_text: str = None,
     # Only compute text-level signals that work on any prose.
     is_ownership = form_type.startswith('SC 13')
 
-    _NO_DATA = {'score': 50, 'has_data': False, 'signal': 'not_applicable'}
+    _NO_DATA = {
+        'score': 50, 'has_data': False, 'signal': 'not_applicable',
+        'interpretation': 'Not applicable for this filing type',
+        'cosine': None, 'jaccard': None, 'size_ratio': None,
+        'has_prior': False, 'delta': None,
+        'current_net_sentiment': None, 'prior_net_sentiment': None,
+        'size_change_pct': 0, 'new_legal_entities': [], 'new_dollar_amounts': [],
+        'risks_added': 0, 'risks_removed': 0,
+        'current_positive_count': 0, 'prior_positive_count': 0,
+        'timing': 'unknown', 'days_after_period': None, 'deadline_days': None,
+    }
 
     if is_ownership:
         mda = _NO_DATA.copy()
@@ -1656,7 +1849,7 @@ def format_signals_for_prompt(signals_data: Dict[str, Any]) -> str:
     pct = round(weights.get('legal_proceedings', 0.08) * 100)
     lines.append(f"6. LEGAL PROCEEDINGS [{pct}% — {citations.get('legal_proceedings', '')}]")
     lines.append(f"   Score: {legal.get('score', 50)}/100")
-    if legal.get('size_change_pct'):
+    if legal.get('size_change_pct') is not None:
         lines.append(f"   Section size change: {legal['size_change_pct']:+.0f}%")
     if legal.get('new_legal_entities'):
         lines.append(f"   New entities: {', '.join(legal['new_legal_entities'][:3])}")
@@ -1693,7 +1886,7 @@ def format_signals_for_prompt(signals_data: Dict[str, Any]) -> str:
     pct = round(weights.get('document_complexity', 0.05) * 100)
     lines.append(f"9. DOCUMENT COMPLEXITY [{pct}% — {citations.get('document_complexity', '')}]")
     lines.append(f"   Score: {cpx.get('score', 50)}/100")
-    if cpx.get('fog_index'):
+    if cpx.get('fog_index') is not None:
         lines.append(f"   Fog index: {cpx['fog_index']:.0f} | Avg sentence length: {cpx.get('avg_sentence_length', 0):.0f} words | Complex words: {cpx.get('complex_word_pct', 0):.0f}%")
     lines.append(f"   {cpx.get('interpretation', 'N/A')}")
     lines.append("")

@@ -5,10 +5,12 @@ Analyzes SEC filings for flags, sentiment, and changes.
 """
 
 import re
-from dataclasses import dataclass, field, asdict
+import logging
 from enum import Enum
 from typing import Optional, List, Dict, Any
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -434,12 +436,12 @@ class SECFilingAnalyzer:
                 import llm_analysis
                 if llm_analysis.is_llm_available():
                     self._llm_module = llm_analysis
-                    print("[Analyzer] LLM mode ACTIVE — using Claude API")
+                    logger.info("[Analyzer] LLM mode ACTIVE — using Claude API")
                 else:
-                    print("[Analyzer] LLM requested but API key not set — falling back to regex")
+                    logger.info("[Analyzer] LLM requested but API key not set — falling back to regex")
                     self.use_llm = False
             except ImportError:
-                print("[Analyzer] LLM module not found — falling back to regex")
+                logger.info("[Analyzer] LLM module not found — falling back to regex")
                 self.use_llm = False
     
     def analyze_filing(
@@ -459,12 +461,12 @@ class SECFilingAnalyzer:
         prior_text_lower = prior_text.lower() if prior_text else None
         
         # ---- FLAG DETECTION ----
-        regex_flags = self._detect_flags(current_text_lower, prior_text_lower)
+        regex_flags = self._detect_flags(current_text_lower, prior_text_lower, current_text)
         
         llm_flags = []
         llm_flag_meta = {}
         if self.use_llm and self._llm_module:
-            print("[Analyzer] Running LLM flag analysis...")
+            logger.info("[Analyzer] Running LLM flag analysis...")
             llm_result = self._llm_module.llm_analyze_flags(current_text, prior_text)
             if llm_result:
                 llm_flags = llm_result.get("flags", [])
@@ -474,7 +476,7 @@ class SECFilingAnalyzer:
                     "overall_assessment": llm_result.get("overall_assessment", ""),
                     "risks_checked_not_found": llm_result.get("risks_checked_not_found", []),
                 }
-                print(f"[Analyzer] LLM found {len(llm_flags)} flags")
+                logger.info("[Analyzer] LLM found %d flags", len(llm_flags))
         
         # Merge flags: LLM flags take priority, regex fills gaps
         flags = self._merge_flags(regex_flags, llm_flags)
@@ -485,12 +487,12 @@ class SECFilingAnalyzer:
         llm_sentiment = []
         llm_sentiment_meta = {}
         if self.use_llm and self._llm_module:
-            print("[Analyzer] Running LLM sentiment analysis...")
+            logger.info("[Analyzer] Running LLM sentiment analysis...")
             llm_sent_result = self._llm_module.llm_analyze_sentiment(current_text, prior_text)
             if llm_sent_result:
                 llm_sentiment = llm_sent_result.get("sentiment_results", [])
                 llm_sentiment_meta = llm_sent_result.get("sentiment_meta", {})
-                print(f"[Analyzer] LLM returned {len(llm_sentiment)} sentiment categories")
+                logger.info("[Analyzer] LLM returned %d sentiment categories", len(llm_sentiment))
         
         # Use LLM sentiment if available (5 categories), else regex (1 category)
         if llm_sentiment:
@@ -613,7 +615,7 @@ class SECFilingAnalyzer:
                 if cat == lf_cat:
                     title_words = set(title_lower.split())
                     lf_words = set(lf_title.split())
-                    if len(title_words & lf_words) >= 1:
+                    if len(title_words & lf_words) >= 2:
                         is_duplicate = True
                         break
             
@@ -624,26 +626,40 @@ class SECFilingAnalyzer:
         return sorted(merged, key=lambda x: abs(x.get("score_impact", 0)), reverse=True)
     
     def _detect_flags(
-        self, 
-        current_text: str, 
-        prior_text: Optional[str]
+        self,
+        current_text: str,
+        prior_text: Optional[str],
+        original_text: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Detect flags in filing text"""
+        """Detect flags in filing text. original_text preserves casing for evidence."""
+        # Use original_text for evidence extraction to preserve casing
+        evidence_source = original_text if original_text else current_text
         flags = []
-        
+
+        # Safe-harbor / forward-looking disclaimer pattern to skip matches within
+        _safe_harbor_re = re.compile(
+            r'(?:forward[- ]looking\s+statements?|safe[- ]harbor|cautionary\s+(?:note|statement))',
+            re.IGNORECASE
+        )
+
         for rule_id, rule in self.flag_rules.items():
             # Check if any pattern matches
             matched = False
             evidence = ""
-            
+
             for pattern in rule['patterns']:
                 match = re.search(pattern, current_text, re.IGNORECASE)
                 if match:
+                    # Check if match is inside a safe-harbor disclaimer section
+                    context_start = max(0, match.start() - 500)
+                    context_before = current_text[context_start:match.start()]
+                    if _safe_harbor_re.search(context_before):
+                        continue  # Skip matches within safe-harbor boilerplate
                     matched = True
-                    # Extract surrounding context as evidence
+                    # Extract surrounding context as evidence from original (cased) text
                     start = max(0, match.start() - 100)
-                    end = min(len(current_text), match.end() + 100)
-                    evidence = current_text[start:end].strip()
+                    end = min(len(evidence_source), match.end() + 100)
+                    evidence = evidence_source[start:end].strip()
                     break
             
             if matched:
@@ -707,10 +723,15 @@ class SECFilingAnalyzer:
                 matches = re.findall(pattern, current_text, re.IGNORECASE)
                 current_scores[level] += len(matches)
         
-        # Determine current sentiment level
+        # Determine current sentiment level; break ties toward neutral (CAUTIOUS)
         max_score = max(current_scores.values())
         if max_score > 0:
-            current_level = max(current_scores.keys(), key=lambda k: current_scores[k])
+            tied_levels = [k for k, v in current_scores.items() if v == max_score]
+            if len(tied_levels) > 1:
+                # Break tie toward neutral (CAUTIOUS=2, NEUTRAL=3)
+                current_level = min(tied_levels, key=lambda k: abs(k.value - SentimentLevel.CAUTIOUS.value))
+            else:
+                current_level = tied_levels[0]
         else:
             current_level = SentimentLevel.NEUTRAL
         

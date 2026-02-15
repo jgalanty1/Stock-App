@@ -12,7 +12,6 @@ Two main capabilities:
 import re
 import logging
 from typing import Dict, Any, Optional, List, Tuple
-from collections import Counter
 from difflib import SequenceMatcher
 
 logger = logging.getLogger(__name__)
@@ -23,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 HEDGING_WORDS = {
     "may", "might", "could", "would", "possibly", "potentially", "uncertain",
-    "uncertain", "approximately", "substantially", "generally", "typically",
+    "approximately", "substantially", "generally", "typically",
     "believe", "anticipate", "expect", "estimate", "intend", "plan",
     "preliminary", "subject to", "contingent", "if applicable",
 }
@@ -50,13 +49,13 @@ BLAME_LANGUAGE = {
 }
 
 SPECIFICITY_MARKERS = re.compile(
-    r'\$[\d,.]+[MBK]?'           # dollar amounts
-    r'|\d+\.?\d*\s*%'            # percentages
-    r'|\d+\.?\d*x'              # multiples
-    r'|\d{1,3}(?:,\d{3})+'      # large numbers with commas
-    r'|increased \d+'            # specific increases
-    r'|decreased \d+'            # specific decreases
-    r'|grew \d+'                 # specific growth
+    r'\$[\d,.]+[MBK]?\b'        # dollar amounts
+    r'|\b\d+\.?\d*\s*%'         # percentages
+    r'|\b\d+\.?\d*x\b'          # multiples
+    r'|\b\d{1,3}(?:,\d{3})+\b'  # large numbers with commas
+    r'|\bincreased \d+'          # specific increases
+    r'|\bdecreased \d+'          # specific decreases
+    r'|\bgrew \d+'               # specific growth
 )
 
 PASSIVE_MARKERS = re.compile(
@@ -77,6 +76,8 @@ RISK_FACTOR_HEADER = re.compile(
     re.IGNORECASE,
 )
 
+# NOTE: This MDA_HEADER pattern is shared with filing_signals.py and catalyst_extractor.py.
+# If you change it here, update it in those modules too.
 MDA_HEADER = re.compile(
     r"(?:item\s*(?:2|7)\.?\s*management'?s?\s*discussion|"
     r"management'?s?\s*discussion\s*and\s*analysis)",
@@ -134,8 +135,8 @@ def _count_pattern_hits(text: str, word_set: set) -> Tuple[int, List[str]]:
         if count > 0:
             total += count
             hits.append(f"{phrase} ({count})")
-    # Sort by frequency descending
-    hits.sort(key=lambda x: int(re.search(r'\((\d+)\)', x).group(1)), reverse=True)
+    # Sort by frequency descending; filter out any entries where regex match fails
+    hits.sort(key=lambda x: int(m.group(1)) if (m := re.search(r'\((\d+)\)', x)) else 0, reverse=True)
     return total, hits[:10]
 
 
@@ -416,9 +417,13 @@ def _diff_sentences(current_text: str, prior_text: str,
     current_sents = _split_sentences(current_text)
     prior_sents = _split_sentences(prior_text)
 
-    # For efficiency, limit to reasonable counts
-    current_sents = current_sents[:200]
-    prior_sents = prior_sents[:200]
+    # For efficiency, limit to reasonable counts to avoid O(n*m) blowup
+    current_sents = current_sents[:100]
+    prior_sents = prior_sents[:100]
+
+    # Early exit if both sections are empty
+    if not current_sents or not prior_sents:
+        return [], []
 
     # Find truly new sentences (no close match in prior)
     added = []

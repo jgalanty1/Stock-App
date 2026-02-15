@@ -23,8 +23,10 @@ import json
 import time
 import re
 import logging
+import threading
+import requests
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Set
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -38,11 +40,10 @@ SEC_USER_AGENT = os.environ.get(
     ""  # Must be set — SEC blocks generic agents
 )
 if not SEC_USER_AGENT:
-    logger.warning(
-        "SEC_USER_AGENT not set! SEC EDGAR requires a real contact email. "
-        "Set SEC_USER_AGENT env var, e.g.: 'MyApp/1.0 (myemail@example.com)'"
+    logger.error(
+        "SEC_USER_AGENT not configured. Set via 'python cli.py setup' or SEC_USER_AGENT env var."
     )
-    SEC_USER_AGENT = "SECFilingAnalyzer/1.0 (user@configure-me.com)"
+    raise ValueError("SEC_USER_AGENT required for EDGAR access")
 
 # Hard market cap bounds (USD). No results outside this range.
 MIN_MARKET_CAP = 20_000_000    # $20M
@@ -63,7 +64,6 @@ TARGET_FORM_TYPES_CIK = [
     "SC 13G", "SC 13G/A",          # Passive large holders
 ]
 TARGET_FORM_TYPES_EFTS = ["SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A", "13F-HR"]  # Supplementary
-TARGET_FORM_TYPES = TARGET_FORM_TYPES_CIK  # Canonical list (all use normalized names)
 
 # How far back to look for filings (days)
 FILING_LOOKBACK_DAYS = 365
@@ -91,10 +91,9 @@ def _normalize_form_type(form_type: str) -> str:
 # RATE LIMITING — 299 requests per minute max for both FMP and EDGAR
 # ------------------------------------------------------------------
 RATE_LIMIT_PER_MIN = 299
-_MIN_INTERVAL = 60.0 / RATE_LIMIT_PER_MIN
 
-# Storage paths
-DATA_DIR = "scraper_data"
+# Storage paths — relative to CWD at import time (assumed to be project root)
+DATA_DIR = os.path.abspath("scraper_data")
 UNIVERSE_FILE = "company_universe.json"
 FILINGS_DIR = "filings"
 FILINGS_INDEX = "filings_index.json"
@@ -107,21 +106,30 @@ FILINGS_INDEX = "filings_index.json"
 class RateLimiter:
     def __init__(self, max_per_minute: int = RATE_LIMIT_PER_MIN):
         self.min_interval = 60.0 / max_per_minute
-        self._last_call = 0.0
+        self._next_slot = 0.0
         self._call_count = 0
         self._window_start = time.monotonic()
+        self._lock = threading.Lock()
 
     def wait(self):
-        now = time.monotonic()
-        elapsed = now - self._last_call
-        if elapsed < self.min_interval:
-            time.sleep(self.min_interval - elapsed)
-        self._last_call = time.monotonic()
-        self._call_count += 1
-        if self._call_count % 100 == 0:
+        # Token-bucket: claim a time slot inside the lock, sleep outside
+        with self._lock:
+            now = time.monotonic()
+            if now < self._next_slot:
+                sleep_until = self._next_slot
+            else:
+                sleep_until = now
+            self._next_slot = sleep_until + self.min_interval
+            self._call_count += 1
+            count = self._call_count
+        # Sleep outside lock so multiple threads can wait concurrently
+        delay = sleep_until - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        if count % 100 == 0:
             window = time.monotonic() - self._window_start
-            rate = self._call_count / (window / 60) if window > 0 else 0
-            logger.info(f"Rate limiter: {self._call_count} calls, {rate:.0f}/min actual")
+            rate = count / (window / 60) if window > 0 else 0
+            logger.info(f"Rate limiter: {count} calls, {rate:.0f}/min actual")
 
     @property
     def stats(self) -> Dict[str, Any]:
@@ -141,20 +149,41 @@ _edgar_limiter = RateLimiter(RATE_LIMIT_PER_MIN)
 # HTTP HELPERS
 # ============================================================================
 
+_session = None
+_session_lock = threading.Lock()
+
 def _get_session():
-    import requests
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": SEC_USER_AGENT,
-        "Accept-Encoding": "gzip, deflate",
-    })
+    """Singleton session for the main thread. Reuses TCP connections."""
+    global _session
+    if _session is None:
+        with _session_lock:
+            if _session is None:
+                s = requests.Session()
+                s.headers.update({
+                    "User-Agent": SEC_USER_AGENT,
+                    "Accept-Encoding": "gzip, deflate",
+                })
+                _session = s
+    return _session
+
+
+_thread_local = threading.local()
+
+def _get_thread_session():
+    """Per-thread session for worker threads. Each thread gets its own session."""
+    session = getattr(_thread_local, 'session', None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": SEC_USER_AGENT,
+            "Accept-Encoding": "gzip, deflate",
+        })
+        _thread_local.session = session
     return session
 
 
 def _safe_request(session, url: str, params: dict = None,
                   limiter: RateLimiter = None, retries: int = 3) -> Optional[Any]:
-    import requests
-
     if limiter is None:
         limiter = _edgar_limiter
 
@@ -167,10 +196,8 @@ def _safe_request(session, url: str, params: dict = None,
                 content_type = resp.headers.get("Content-Type", "")
                 if "json" in content_type:
                     return resp.json()
-                try:
-                    return resp.json()
-                except Exception:
-                    return resp.text
+                # Not JSON content type — return as text
+                return resp.text
 
             elif resp.status_code == 429:
                 wait = min(2 ** (attempt + 2), 30)
@@ -225,8 +252,6 @@ def test_fmp_api(fmp_api_key: str) -> Dict[str, Any]:
     Run diagnostics against FMP to verify key validity and screener access.
     Returns detailed results for display to user.
     """
-    import requests
-
     results = {
         "key_provided": bool(fmp_api_key),
         "key_length": len(fmp_api_key) if fmp_api_key else 0,
@@ -256,9 +281,10 @@ def test_fmp_api(fmp_api_key: str) -> Dict[str, Any]:
             "limit": 5,
             "apikey": fmp_api_key,
         }
+        _fmp_limiter.wait()
         resp = session.get(url, params=params, timeout=15)
         test1["http_status"] = resp.status_code
-        test1["response_preview"] = resp.text[:800]
+        test1["response_preview"] = resp.text[:800].replace(fmp_api_key, 'REDACTED')
 
         if resp.status_code == 200:
             data = resp.json()
@@ -303,9 +329,10 @@ def test_fmp_api(fmp_api_key: str) -> Dict[str, Any]:
             "limit": 5,
             "apikey": fmp_api_key,
         }
+        _fmp_limiter.wait()
         resp = session.get(url, params=params, timeout=15)
         test2["http_status"] = resp.status_code
-        test2["response_preview"] = resp.text[:800]
+        test2["response_preview"] = resp.text[:800].replace(fmp_api_key, 'REDACTED')
 
         if resp.status_code == 200:
             data = resp.json()
@@ -342,6 +369,7 @@ def test_fmp_api(fmp_api_key: str) -> Dict[str, Any]:
     try:
         url = "https://financialmodelingprep.com/stable/profile"
         params = {"symbol": "AAPL", "apikey": fmp_api_key}
+        _fmp_limiter.wait()
         resp = session.get(url, params=params, timeout=15)
         test3["http_status"] = resp.status_code
         if resp.status_code == 200:
@@ -403,8 +431,8 @@ def build_universe_fmp(fmp_api_key: str,
        OTC exchange codes. Filter by country=US only, keep all exchanges.
     4. The screener does server-side market cap filtering.
     """
-    min_cap = int(min_market_cap) if min_market_cap else MIN_MARKET_CAP
-    max_cap = int(max_market_cap) if max_market_cap else MAX_MARKET_CAP
+    min_cap = int(min_market_cap) if min_market_cap is not None else MIN_MARKET_CAP
+    max_cap = int(max_market_cap) if max_market_cap is not None else MAX_MARKET_CAP
     session = _get_session()
     all_companies = []
     working_endpoint = None
@@ -566,8 +594,12 @@ def resolve_ciks(companies: List[Dict], session=None,
     without_cik = [c for c in companies if not c.get("cik")]
 
     if without_cik:
-        logger.warning(f"Dropped {len(without_cik)} without CIK: "
-                      f"{[c['ticker'] for c in without_cik[:20]]}")
+        shown = [c['ticker'] for c in without_cik[:20]]
+        omitted = len(without_cik) - len(shown)
+        msg = f"Dropped {len(without_cik)} without CIK: {shown}"
+        if omitted > 0:
+            msg += f" (and {omitted} more)"
+        logger.warning(msg)
 
     logger.info(f"CIK: {resolved}/{len(companies)} resolved, {len(with_cik)} ready")
     return with_cik
@@ -582,7 +614,7 @@ def get_company_filings(cik: str, session=None,
     if session is None:
         session = _get_session()
     if form_types is None:
-        form_types = TARGET_FORM_TYPES
+        form_types = TARGET_FORM_TYPES_CIK
 
     url = f"https://data.sec.gov/submissions/CIK{cik}.json"
     data = _safe_request(session, url, limiter=_edgar_limiter)
@@ -602,7 +634,7 @@ def get_company_filings(cik: str, session=None,
     event_cutoff = (datetime.now() - timedelta(days=EVENT_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
 
     for i in range(len(forms)):
-        form_type = forms[i] if i < len(forms) else ""
+        form_type = forms[i]
         filing_date = dates[i] if i < len(dates) else ""
         accession = accessions[i] if i < len(accessions) else ""
         primary_doc = primary_docs[i] if i < len(primary_docs) else ""
@@ -671,7 +703,11 @@ def _efts_search(session, query: str, form_types: List[str],
                 logger.warning(f"EFTS GET failed: HTTP {resp.status_code}")
                 continue
 
-            data = resp.json()
+            try:
+                data = resp.json()
+            except json.JSONDecodeError as e:
+                logger.error(f"EFTS response not valid JSON for form={form_type}: {e}")
+                continue
             hits_obj = data.get('hits', {})
             if isinstance(hits_obj, dict):
                 hit_list = hits_obj.get('hits', [])
@@ -840,8 +876,8 @@ def download_filing(filing: Dict, output_dir: str,
     if session is None:
         session = _get_session()
 
-    ticker = filing.get("ticker", "UNKNOWN")
-    form_type = filing["form_type"].replace("/", "-").replace(" ", "-")
+    ticker = re.sub(r'[^\w.-]', '_', filing.get("ticker", "UNKNOWN"))
+    form_type = re.sub(r'[^\w.-]', '_', filing["form_type"].replace("/", "-").replace(" ", "-"))
     date = filing["filing_date"]
 
     filename = f"{ticker}_{form_type}_{date}.html"
@@ -858,6 +894,8 @@ def download_filing(filing: Dict, output_dir: str,
         content = _safe_request(session, url, limiter=_edgar_limiter)
 
     # If direct URL failed (404, wrong CIK, etc.), resolve via accession
+    # Make a copy to avoid mutating the shared filing dict
+    filing = dict(filing)
     if not content or not isinstance(content, str) or len(content) <= 100:
         resolved_url = _resolve_filing_url(filing, session)
         if resolved_url and resolved_url != url:
@@ -942,13 +980,13 @@ def _resolve_filing_url(filing: Dict, session) -> Optional[str]:
         if best:
             url = base_url + best
             filing["primary_document"] = best
-            logger.info(f"Resolved filing URL: {url} ({max(best_html_size, best_xml_size)} bytes)")
+            doc_size = best_html_size if best_html else best_xml_size
+            logger.info(f"Resolved filing URL: {url} (document size: {doc_size} bytes)")
             return url
 
     # Fallback: try HTML index page and parse it
     html = _safe_request(session, base_url, limiter=_edgar_limiter)
     if html and isinstance(html, str):
-        import re
         links = re.findall(r'href="([^"]+\.(?:htm[l]?|txt|xml))"', html, re.IGNORECASE)
         doc_links = [l for l in links if "index" not in l.lower() and not l.startswith("R")]
         if doc_links:
@@ -965,13 +1003,12 @@ def _extract_text_from_xml(xml_content: str) -> str:
     Extract readable text from SEC XML filings (SCHEDULE 13D/G format).
     Falls back to stripping tags if XML parsing fails.
     """
-    import re
     try:
         import xml.etree.ElementTree as ET
         # Try to find the XML within potential HTML wrapper
-        xml_match = re.search(r'<\?xml.*', xml_content, re.DOTALL)
-        if xml_match:
-            xml_content = xml_match.group(0)
+        xml_start = xml_content.find('<?xml')
+        if xml_start > 0:
+            xml_content = xml_content[xml_start:]
 
         root = ET.fromstring(xml_content)
         # Collect all text content recursively
@@ -1020,6 +1057,10 @@ def _cache_filing_text(filepath: str) -> Optional[str]:
         return cache_path
 
     try:
+        file_size = os.path.getsize(filepath)
+        if file_size > 50_000_000:
+            logger.warning("Large file: %s (%d bytes)", filepath, file_size)
+
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
 
@@ -1101,25 +1142,41 @@ class SECScraper:
         self.index_path = os.path.join(data_dir, FILINGS_INDEX)
         self.universe: List[Dict] = []
         self.filings_index: List[Dict] = []
+        self._save_lock = threading.Lock()
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.filings_dir, exist_ok=True)
         self._load_state()
 
     def _load_state(self):
         if os.path.exists(self.universe_path):
-            with open(self.universe_path) as f:
-                self.universe = json.load(f)
-            logger.info(f"Loaded universe: {len(self.universe)} companies")
+            try:
+                with open(self.universe_path) as f:
+                    self.universe = json.load(f)
+                logger.info(f"Loaded universe: {len(self.universe)} companies")
+            except json.JSONDecodeError as e:
+                logger.error(f"Corrupt universe file {self.universe_path}: {e}")
+                self.universe = []
         if os.path.exists(self.index_path):
-            with open(self.index_path) as f:
-                self.filings_index = json.load(f)
-            logger.info(f"Loaded filings index: {len(self.filings_index)} filings")
+            try:
+                with open(self.index_path) as f:
+                    self.filings_index = json.load(f)
+                logger.info(f"Loaded filings index: {len(self.filings_index)} filings")
+            except json.JSONDecodeError as e:
+                logger.error(f"Corrupt filings index {self.index_path}: {e}")
+                self.filings_index = []
 
     def _save_state(self):
-        with open(self.universe_path, "w") as f:
-            json.dump(self.universe, f, indent=2)
-        with open(self.index_path, "w") as f:
-            json.dump(self.filings_index, f, indent=2)
+        with self._save_lock:
+            # Atomic write: write to tmp file then rename
+            tmp_universe = self.universe_path + ".tmp"
+            with open(tmp_universe, "w") as f:
+                json.dump(self.universe, f, indent=2)
+            os.replace(tmp_universe, self.universe_path)
+
+            tmp_index = self.index_path + ".tmp"
+            with open(tmp_index, "w") as f:
+                json.dump(self.filings_index, f, indent=2)
+            os.replace(tmp_index, self.index_path)
 
     def step1_build_universe(self, fmp_api_key: str = None,
                               progress_callback=None,
@@ -1176,7 +1233,7 @@ class SECScraper:
         companies = self.universe[:max_companies] if max_companies else self.universe
         total = len(companies)
         found = 0
-        target_set = set(TARGET_FORM_TYPES)
+        target_set = set(TARGET_FORM_TYPES_CIK)
         efts_types = set(TARGET_FORM_TYPES_EFTS)
 
         # Build set of existing accession numbers for dedup
@@ -1201,23 +1258,24 @@ class SECScraper:
                 if cleaned != prev:
                     company["scanned_form_types"] = sorted(cleaned)
 
-        for i, company in enumerate(companies):
-            if cancel_event and cancel_event.is_set():
-                logger.info(f"step2_find_filings cancelled at {i}/{total}")
-                self._save_state()
-                raise InterruptedError(f"Cancelled after {i}/{total} companies ({found} filings found)")
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
+        # Separate companies that need scanning from those already done
+        to_scan = []
+        for company in companies:
+            prev_scanned = set(company.get("scanned_form_types", []))
+            missing_types = target_set - prev_scanned
+            if missing_types:
+                to_scan.append((company, missing_types))
+
+        done_count = total - len(to_scan)
+        lock = threading.Lock()
+
+        def _search_one(company, missing_types):
+            session = _get_thread_session()
             cik = company["cik"]
             ticker = company["ticker"]
             company_name = company.get("company_name", "")
-
-            prev_scanned = set(company.get("scanned_form_types", []))
-            missing_types = target_set - prev_scanned
-
-            if not missing_types:
-                if progress_callback:
-                    progress_callback(i + 1, total, ticker, 0)
-                continue
 
             new_filings = []
 
@@ -1228,15 +1286,12 @@ class SECScraper:
             logger.info(f"{ticker}: CIK search for {missing_types} → {len(cik_filings)}")
 
             # ---- Supplementary: EFTS company name search for SC 13D ----
-            # CIK submissions usually has SC 13D, but EFTS can catch any missed.
-            # Only search if we're looking for SC 13D types AND company name is available.
             missing_efts = missing_types & efts_types
             if missing_efts and company_name:
                 cik_accessions = {f.get("accession_number") for f in cik_filings}
                 efts_filings = search_filings_about_company(
                     ticker, company_name, cik, session,
                     form_types=list(missing_efts))
-                # Only add EFTS results not already found via CIK
                 efts_new = 0
                 for ef in efts_filings:
                     if ef.get("accession_number") not in cik_accessions:
@@ -1245,27 +1300,47 @@ class SECScraper:
                 if efts_new:
                     logger.info(f"{ticker}: EFTS supplementary found {efts_new} extra SC 13D")
 
-            for filing in new_filings:
-                if filing.get("accession_number") in existing_accessions:
+            return company, new_filings
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {}
+            for company, missing_types in to_scan:
+                if cancel_event and cancel_event.is_set():
+                    break
+                futures[executor.submit(_search_one, company, missing_types)] = company
+
+            for future in as_completed(futures):
+                try:
+                    company, new_filings = future.result()
+                except Exception as e:
+                    logger.error("Future failed: %s", e)
                     continue
-                filing["ticker"] = ticker
-                filing["company_name"] = company.get("company_name", "")
-                filing["exchange"] = company.get("exchange", "")
-                filing["market_cap"] = company.get("market_cap")
-                filing["downloaded"] = False
-                filing["local_path"] = None
-                filing["analyzed"] = False
-                self.filings_index.append(filing)
-                existing_accessions.add(filing.get("accession_number"))
-                found += 1
+                ticker = company["ticker"]
+                with lock:
+                    done_count += 1
+                    added = 0
+                    for filing in new_filings:
+                        if filing.get("accession_number") in existing_accessions:
+                            continue
+                        filing["ticker"] = ticker
+                        filing["company_name"] = company.get("company_name", "")
+                        filing["exchange"] = company.get("exchange", "")
+                        filing["market_cap"] = company.get("market_cap")
+                        filing["downloaded"] = False
+                        filing["local_path"] = None
+                        filing["analyzed"] = False
+                        self.filings_index.append(filing)
+                        existing_accessions.add(filing.get("accession_number"))
+                        found += 1
+                        added += 1
 
-            company["scanned_form_types"] = sorted(target_set)
-            company["scan_version"] = SCAN_VERSION
+                    company["scanned_form_types"] = sorted(target_set)
+                    company["scan_version"] = SCAN_VERSION
 
-            if progress_callback:
-                progress_callback(i + 1, total, ticker, len(new_filings))
-            if (i + 1) % 50 == 0:
-                self._save_state()
+                    if progress_callback:
+                        progress_callback(done_count, total, ticker, added)
+                    if done_count % 50 == 0:
+                        self._save_state()
 
         self._save_state()
         logger.info(f"Filing search: {found} new filings across {total} companies")
@@ -1274,7 +1349,7 @@ class SECScraper:
     def step3_download_filings(self, max_downloads: int = None,
                                 progress_callback=None,
                                 cancel_event=None) -> int:
-        session = _get_session()
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         # Dedup: remove duplicate accession numbers before downloading (#10)
         seen_acc = set()
@@ -1299,38 +1374,51 @@ class SECScraper:
 
         total = len(pending)
         downloaded = 0
+        done_count = 0
+        lock = threading.Lock()
 
-        for i, filing in enumerate(pending):
-            if cancel_event and cancel_event.is_set():
-                logger.info(f"step3_download_filings cancelled at {i}/{total}")
-                self._save_state()
-                raise InterruptedError(f"Cancelled after {i}/{total} downloads ({downloaded} succeeded)")
-
+        def _download_one(filing):
+            session = _get_thread_session()
             path = download_filing(filing, self.filings_dir, session)
             if path:
-                filing["downloaded"] = True
-                filing["local_path"] = path
-                filing["download_retries"] = 0
-                downloaded += 1
-
                 # Text cache: pre-extract and cache cleaned text (#22)
                 try:
                     _cache_filing_text(path)
                 except Exception as e:
                     logger.debug(f"Text cache failed for {path}: {e}")
-            else:
-                # Increment retry counter (#9)
-                filing["download_retries"] = filing.get("download_retries", 0) + 1
-                logger.info(
-                    f"Download failed for {filing.get('ticker','?')} "
-                    f"{filing.get('form_type','?')} (retry {filing['download_retries']}/3)"
-                )
+            return filing, path
 
-            if progress_callback:
-                progress_callback(i + 1, total, filing.get("ticker", ""),
-                                path is not None)
-            if (i + 1) % 25 == 0:
-                self._save_state()
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {}
+            for filing in pending:
+                if cancel_event and cancel_event.is_set():
+                    break
+                futures[executor.submit(_download_one, filing)] = filing
+
+            for future in as_completed(futures):
+                try:
+                    filing, path = future.result()
+                except Exception as e:
+                    logger.error("Future failed: %s", e)
+                    continue
+                with lock:
+                    done_count += 1
+                    if path:
+                        filing["downloaded"] = True
+                        filing["local_path"] = path
+                        filing["download_retries"] = 0
+                        downloaded += 1
+                    else:
+                        filing["download_retries"] = filing.get("download_retries", 0) + 1
+                        logger.info(
+                            f"Download failed for {filing.get('ticker','?')} "
+                            f"{filing.get('form_type','?')} (retry {filing['download_retries']}/3)"
+                        )
+                    if progress_callback:
+                        progress_callback(done_count, total, filing.get("ticker", ""),
+                                        path is not None)
+                    if done_count % 25 == 0:
+                        self._save_state()
 
         self._save_state()
         logger.info(f"Downloaded {downloaded}/{total} filings")
@@ -1341,48 +1429,48 @@ class SECScraper:
     # ------------------------------------------------------------------
 
     def step4_fetch_insider_data(self, progress_callback=None,
-                                  cancel_event=None) -> int:
+                                  cancel_event=None,
+                                  company_tickers: Set[str] = None) -> int:
         """
         For each company in universe that has a CIK, fetch Form 4 transactions
         and SC 13D/G metadata from EDGAR, compute aggregate insider signal,
         and store on the company record.  This data is later used by Tier 2
         analysis and surfaced in the Filings tab.
+
+        If company_tickers is provided, only fetch for those tickers (e.g. the
+        subset that was actually scanned).
         """
         from insider_tracker import (
             fetch_insider_transactions, fetch_institutional_filings,
             analyze_insider_activity,
         )
 
-        session = _get_session()
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         companies = [c for c in self.universe if c.get('cik')]
+        if company_tickers:
+            upper_tickers = {t.upper() for t in company_tickers}
+            companies = [c for c in companies
+                         if c.get('ticker', '').upper() in upper_tickers]
+
+        # Split into already-done and pending
+        pending = [c for c in companies if not c.get('insider_data')]
         total = len(companies)
         fetched = 0
+        done_count = total - len(pending)
+        lock = threading.Lock()
 
-        for i, company in enumerate(companies):
-            if cancel_event and cancel_event.is_set():
-                self._save_state()
-                raise InterruptedError(
-                    f"Insider fetch cancelled after {i}/{total} ({fetched} done)"
-                )
-
+        def _fetch_one(company):
+            session = _get_thread_session()
             ticker = company.get('ticker', '')
             cik = company['cik']
-
-            # Skip if already fetched (idempotent)
-            if company.get('insider_data'):
-                if progress_callback:
-                    progress_callback(i + 1, total, ticker, True)
-                continue
-
             try:
                 txns = fetch_insider_transactions(cik, session, _edgar_limiter)
                 inst = fetch_institutional_filings(cik, session, _edgar_limiter,
                                                     ticker=ticker,
                                                     company_name=company.get('company_name', ''))
                 result = analyze_insider_activity(txns, inst)
-
-                # Store compact summary on company record (persisted to JSON)
-                company['insider_data'] = {
+                data = {
                     'signal': result.get('signal', 'no_data'),
                     'accumulation_score': result.get('accumulation_score', 50),
                     'open_market_buys': result.get('open_market_buys', 0),
@@ -1400,19 +1488,38 @@ class SECScraper:
                     'notable_transactions': result.get('notable_transactions', [])[:5],
                     'summary': result.get('summary', ''),
                 }
-                fetched += 1
+                return company, ticker, data, True
             except Exception as e:
                 logger.warning(f"{ticker} (CIK {cik}): insider fetch failed: {e}")
-                company['insider_data'] = {
+                data = {
                     'signal': 'error',
                     'accumulation_score': 50,
                     'error': str(e),
                 }
+                return company, ticker, data, False
 
-            if progress_callback:
-                progress_callback(i + 1, total, ticker, True)
-            if (i + 1) % 25 == 0:
-                self._save_state()
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {}
+            for company in pending:
+                if cancel_event and cancel_event.is_set():
+                    break
+                futures[executor.submit(_fetch_one, company)] = company
+
+            for future in as_completed(futures):
+                try:
+                    company, ticker, data, success = future.result()
+                except Exception as e:
+                    logger.error("Future failed: %s", e)
+                    continue
+                with lock:
+                    company['insider_data'] = data
+                    if success:
+                        fetched += 1
+                    done_count += 1
+                    if progress_callback:
+                        progress_callback(done_count, total, ticker, True)
+                    if done_count % 25 == 0:
+                        self._save_state()
 
         self._save_state()
         logger.info(f"Insider data fetched for {fetched}/{total} companies")
@@ -1441,10 +1548,12 @@ class SECScraper:
             ft = f.get("form_type", "Unknown")
             by_form[ft] = by_form.get(ft, 0) + 1
 
-        cap_ranges = {"$20-40M": 0, "$40-60M": 0, "$60-80M": 0, "$80-100M": 0}
+        cap_ranges = {"<$20M": 0, "$20-40M": 0, "$40-60M": 0, "$60-80M": 0, "$80-100M": 0}
         for c in self.universe:
             mc = c.get("market_cap", 0) or 0
-            if mc < 40_000_000:
+            if mc < 20_000_000:
+                cap_ranges["<$20M"] += 1
+            elif mc < 40_000_000:
                 cap_ranges["$20-40M"] += 1
             elif mc < 60_000_000:
                 cap_ranges["$40-60M"] += 1
@@ -1634,8 +1743,9 @@ class SECScraper:
             results.sort(key=lambda x: x.get("final_gem_score") or x.get("tier1_score") or 0, reverse=True)
         return results
 
-    def _normalize_score(self, score):
-        """Normalize any score to 0-100 scale. Detects 1-10 scale and multiplies."""
+    @staticmethod
+    def _normalize_score(score):
+        """Normalize any score to 0-100 scale."""
         if score is None:
             return None
         try:
@@ -1643,7 +1753,7 @@ class SECScraper:
         except (TypeError, ValueError):
             return None
         if s <= 10:
-            s = s * 10
+            logger.warning("Score in 0-10 range: %s", score)
         return round(min(100, max(0, s)), 1)
 
     def _get_filing_score(self, f):
@@ -1833,6 +1943,7 @@ class SECScraper:
         return stocks
 
     def clear_universe(self):
+        logger.info("Clearing universe data")
         self.universe = []
         self.filings_index = []
         self._save_state()

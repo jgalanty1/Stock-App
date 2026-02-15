@@ -21,8 +21,7 @@ Uses EDGAR XBRL endpoint:
 """
 
 import logging
-import math
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -82,15 +81,59 @@ CASH_CONCEPTS = [
     "CashCashEquivalentsAndShortTermInvestments",
 ]
 
-DEBT_CONCEPTS = [
-    "LongTermDebt",
-    "LongTermDebtNoncurrent",
-    "DebtInstrumentCarryingAmount",
-]
-
 EPS_CONCEPTS = [
     "EarningsPerShareBasic",
     "EarningsPerShareDiluted",
+]
+
+# Additional concepts for ratio inflections
+CAPEX_CONCEPTS = [
+    "PaymentsToAcquirePropertyPlantAndEquipment",
+    "CapitalExpenditureDiscontinuedOperations",
+    "PaymentsToAcquireProductiveAssets",
+]
+
+ACCOUNTS_RECEIVABLE_CONCEPTS = [
+    "AccountsReceivableNetCurrent",
+    "AccountsReceivableNet",
+    "ReceivablesNetCurrent",
+]
+
+INVENTORY_CONCEPTS = [
+    "InventoryNet",
+    "InventoryFinishedGoods",
+    "InventoryRawMaterials",
+]
+
+DEFERRED_REVENUE_CONCEPTS = [
+    "DeferredRevenueCurrent",
+    "DeferredRevenueCurrentAndNoncurrent",
+    "ContractWithCustomerLiabilityCurrent",
+    "DeferredRevenue",
+]
+
+SBC_CONCEPTS = [
+    "ShareBasedCompensation",
+    "AllocatedShareBasedCompensationExpense",
+    "StockBasedCompensation",
+]
+
+INTEREST_EXPENSE_CONCEPTS = [
+    "InterestExpense",
+    "InterestExpenseDebt",
+    "InterestIncomeExpenseNet",
+]
+
+TOTAL_LIABILITIES_CONCEPTS = [
+    "Liabilities",
+    "LiabilitiesCurrent",
+]
+
+LONG_TERM_DEBT_CONCEPTS = [
+    "LongTermDebt",
+    "LongTermDebtNoncurrent",
+    "DebtInstrumentCarryingAmount",
+    "LongTermDebtAndCapitalLeaseObligations",
 ]
 
 
@@ -274,6 +317,50 @@ def extract_financial_metrics(facts: Dict) -> Dict:
     if eps:
         metrics["eps"] = eps
 
+    # CapEx (for FCF computation)
+    capex = _extract_concept_series(facts, CAPEX_CONCEPTS)
+    if capex:
+        metrics["capex"] = capex
+
+    # Accounts receivable (for DSO computation)
+    ar = _extract_concept_series(facts, ACCOUNTS_RECEIVABLE_CONCEPTS)
+    if ar:
+        metrics["accounts_receivable"] = ar
+
+    # Inventory
+    inv = _extract_concept_series(facts, INVENTORY_CONCEPTS)
+    if inv:
+        metrics["inventory"] = inv
+
+    # Deferred revenue
+    defrev = _extract_concept_series(facts, DEFERRED_REVENUE_CONCEPTS)
+    if defrev:
+        metrics["deferred_revenue"] = defrev
+
+    # Stock-based compensation
+    sbc = _extract_concept_series(facts, SBC_CONCEPTS, quarterly_only=True)
+    if not sbc:
+        sbc = _extract_concept_series(facts, SBC_CONCEPTS)
+    if sbc:
+        metrics["sbc"] = sbc
+
+    # Interest expense
+    intexp = _extract_concept_series(facts, INTEREST_EXPENSE_CONCEPTS, quarterly_only=True)
+    if not intexp:
+        intexp = _extract_concept_series(facts, INTEREST_EXPENSE_CONCEPTS)
+    if intexp:
+        metrics["interest_expense"] = intexp
+
+    # Total liabilities (for debt/equity ratio)
+    liab = _extract_concept_series(facts, TOTAL_LIABILITIES_CONCEPTS)
+    if liab:
+        metrics["total_liabilities"] = liab
+
+    # Long-term debt (for debt/EBITDA)
+    ltd = _extract_concept_series(facts, LONG_TERM_DEBT_CONCEPTS)
+    if ltd:
+        metrics["long_term_debt"] = ltd
+
     return metrics
 
 
@@ -283,9 +370,9 @@ def extract_financial_metrics(facts: Dict) -> Dict:
 
 def _growth_rate(current: float, prior: float) -> Optional[float]:
     """Calculate growth rate, handling zero/negative priors."""
-    if prior == 0:
-        return None
-    return (current - prior) / abs(prior)
+    if prior is not None and prior != 0:
+        return (current - prior) / abs(prior)
+    return None
 
 
 def _get_recent_values(series: List[Dict], n: int = 8) -> List[Tuple[str, float]]:
@@ -368,7 +455,8 @@ def detect_inflections(metrics: Dict) -> Dict:
                 score_adjustments -= 12
 
         # INFLECTION: Revenue approaching institutional threshold
-        if latest_rev:
+        if latest_rev is not None:
+            # Assumes quarterly data when is_quarterly flag is set; annual otherwise
             annual_run_rate = latest_rev * 4 if rev[-1].get("is_quarterly") else latest_rev
             summary["annual_revenue_run_rate"] = annual_run_rate
             if 15_000_000 <= annual_run_rate <= 50_000_000:
@@ -603,6 +691,218 @@ def detect_inflections(metrics: Dict) -> Dict:
                     })
                     score_adjustments -= 12
 
+    # ---- Free Cash Flow (OCF - CapEx) ----
+    ocf = metrics.get("operating_cash_flow", [])
+    capex = metrics.get("capex", [])
+    if len(ocf) >= 2 and len(capex) >= 2:
+        ocf_lookup = {s["period_end"]: s["value"] for s in ocf}
+        fcf_series = []
+        for c in capex:
+            o = ocf_lookup.get(c["period_end"])
+            if o is not None:
+                fcf_series.append((c["period_end"], o - abs(c["value"])))
+        if len(fcf_series) >= 2:
+            summary["latest_fcf"] = fcf_series[-1][1]
+            # FCF turning positive
+            if len(fcf_series) >= 2 and fcf_series[-2][1] < 0 and fcf_series[-1][1] > 0:
+                inflections.append({
+                    "type": "fcf_positive",
+                    "description": (
+                        f"Free cash flow turned POSITIVE: "
+                        f"${fcf_series[-2][1]/1e6:.2f}M → ${fcf_series[-1][1]/1e6:.2f}M"
+                    ),
+                    "significance": "high",
+                    "direction": "positive",
+                })
+                score_adjustments += 12
+            # FCF improving trend
+            elif len(fcf_series) >= 3:
+                recent_fcf = fcf_series[-3:]
+                if all(recent_fcf[i][1] > recent_fcf[i-1][1] for i in range(1, len(recent_fcf))):
+                    inflections.append({
+                        "type": "fcf_improving",
+                        "description": (
+                            f"FCF trending up: "
+                            f"{' → '.join(f'${v/1e6:.1f}M' for _, v in recent_fcf)}"
+                        ),
+                        "significance": "medium",
+                        "direction": "positive",
+                    })
+                    score_adjustments += 6
+
+    # ---- Days Sales Outstanding (DSO) ----
+    ar = metrics.get("accounts_receivable", [])
+    revenue_val = metrics.get("revenue", [])
+    if len(ar) >= 2 and len(revenue_val) >= 2:
+        rev_lookup = {s["period_end"]: s["value"] for s in revenue_val}
+        dso_series = []
+        for a in ar:
+            r = rev_lookup.get(a["period_end"])
+            if r and r > 0:
+                dso = (a["value"] / r) * 90  # Approximate quarterly days
+                dso_series.append((a["period_end"], dso))
+        if len(dso_series) >= 2:
+            summary["latest_dso"] = round(dso_series[-1][1], 1)
+            # DSO increasing = negative (stretching collections)
+            if len(dso_series) >= 3:
+                recent_dso = dso_series[-3:]
+                dso_vals = [d for _, d in recent_dso]
+                if all(dso_vals[i] > dso_vals[i-1] + 2 for i in range(1, len(dso_vals))):
+                    inflections.append({
+                        "type": "dso_increasing",
+                        "description": (
+                            f"DSO rising (collection slowing): "
+                            f"{dso_vals[0]:.0f} → {dso_vals[-1]:.0f} days"
+                        ),
+                        "significance": "medium",
+                        "direction": "negative",
+                    })
+                    score_adjustments -= 6
+                elif all(dso_vals[i] < dso_vals[i-1] - 2 for i in range(1, len(dso_vals))):
+                    inflections.append({
+                        "type": "dso_decreasing",
+                        "description": (
+                            f"DSO improving (faster collections): "
+                            f"{dso_vals[0]:.0f} → {dso_vals[-1]:.0f} days"
+                        ),
+                        "significance": "medium",
+                        "direction": "positive",
+                    })
+                    score_adjustments += 4
+
+    # ---- Deferred Revenue trend ----
+    defrev = metrics.get("deferred_revenue", [])
+    if len(defrev) >= 3:
+        recent_defrev = _get_recent_values(defrev, 4)
+        summary["latest_deferred_revenue"] = recent_defrev[-1][1]
+        if len(recent_defrev) >= 3:
+            vals = [v for _, v in recent_defrev[-3:]]
+            # Growing deferred revenue = future revenue in the pipeline
+            if all(vals[i] > vals[i-1] * 1.05 for i in range(1, len(vals))):
+                growth = _growth_rate(vals[-1], vals[0])
+                inflections.append({
+                    "type": "deferred_revenue_growth",
+                    "description": (
+                        (f"Deferred revenue growing (future revenue pipeline): "
+                        f"${vals[0]/1e6:.1f}M → ${vals[-1]/1e6:.1f}M "
+                        f"({growth*100:.0f}%)") if growth else ""
+                    ),
+                    "significance": "medium",
+                    "direction": "positive",
+                })
+                score_adjustments += 6
+
+    # ---- SBC as % of Revenue ----
+    sbc = metrics.get("sbc", [])
+    if len(sbc) >= 2 and len(rev) >= 2:
+        rev_lookup_sbc = {s["period_end"]: s["value"] for s in rev}
+        sbc_pct_series = []
+        for s in sbc:
+            r = rev_lookup_sbc.get(s["period_end"])
+            if r and r > 0:
+                sbc_pct_series.append((s["period_end"], s["value"] / r * 100))
+        if len(sbc_pct_series) >= 2:
+            summary["latest_sbc_pct_revenue"] = round(sbc_pct_series[-1][1], 1)
+            # SBC > 20% of revenue = dilution concern
+            if sbc_pct_series[-1][1] > 20:
+                inflections.append({
+                    "type": "high_sbc",
+                    "description": (
+                        f"High stock-based compensation: {sbc_pct_series[-1][1]:.0f}% of revenue"
+                    ),
+                    "significance": "medium",
+                    "direction": "negative",
+                })
+                score_adjustments -= 5
+            # SBC declining trend = positive
+            if len(sbc_pct_series) >= 3:
+                recent_sbc = [p for _, p in sbc_pct_series[-3:]]
+                if all(recent_sbc[i] < recent_sbc[i-1] for i in range(1, len(recent_sbc))):
+                    inflections.append({
+                        "type": "sbc_declining",
+                        "description": (
+                            f"SBC as % of revenue declining: "
+                            f"{recent_sbc[0]:.0f}% → {recent_sbc[-1]:.0f}%"
+                        ),
+                        "significance": "low",
+                        "direction": "positive",
+                    })
+                    score_adjustments += 3
+
+    # ---- Interest Coverage (Operating Income / Interest Expense) ----
+    oi = metrics.get("operating_income", [])
+    intexp = metrics.get("interest_expense", [])
+    if len(oi) >= 2 and len(intexp) >= 2:
+        intexp_lookup = {s["period_end"]: s["value"] for s in intexp}
+        coverage_series = []
+        for o in oi:
+            ie = intexp_lookup.get(o["period_end"])
+            if ie and abs(ie) > 0:
+                coverage_series.append((o["period_end"], o["value"] / abs(ie)))
+        if len(coverage_series) >= 2:
+            summary["latest_interest_coverage"] = round(coverage_series[-1][1], 1)
+            # Interest coverage < 1.5x = distress risk
+            if coverage_series[-1][1] < 1.5 and coverage_series[-1][1] > 0:
+                inflections.append({
+                    "type": "low_interest_coverage",
+                    "description": (
+                        f"Low interest coverage ratio: {coverage_series[-1][1]:.1f}x "
+                        f"(distress risk if <1.5x)"
+                    ),
+                    "significance": "high",
+                    "direction": "negative",
+                })
+                score_adjustments -= 8
+            # Coverage improving from low levels
+            if len(coverage_series) >= 2:
+                prev_cov = coverage_series[-2][1]
+                curr_cov = coverage_series[-1][1]
+                if prev_cov < 2 and curr_cov > prev_cov * 1.3:
+                    inflections.append({
+                        "type": "interest_coverage_improving",
+                        "description": (
+                            f"Interest coverage improving: {prev_cov:.1f}x → {curr_cov:.1f}x"
+                        ),
+                        "significance": "medium",
+                        "direction": "positive",
+                    })
+                    score_adjustments += 5
+
+    # ---- Debt / EBITDA ----
+    ltd = metrics.get("long_term_debt", [])
+    if ltd and (metrics.get("operating_income") or metrics.get("net_income")):
+        # Approximate EBITDA from operating income (EBITDA concepts often unavailable)
+        oi_data = metrics.get("operating_income", metrics.get("net_income", []))
+        if len(ltd) >= 1 and len(oi_data) >= 1:
+            latest_debt = ltd[-1]["value"]
+            latest_oi_val = oi_data[-1]["value"]
+            # Annualize if quarterly
+            if oi_data[-1].get("is_quarterly"):
+                latest_oi_val *= 4
+            if latest_oi_val > 0:
+                debt_ebitda = latest_debt / latest_oi_val
+                summary["debt_to_ebitda_approx"] = round(debt_ebitda, 1)
+                if debt_ebitda > 5:
+                    inflections.append({
+                        "type": "high_leverage",
+                        "description": (
+                            f"High leverage: Debt/EBITDA(approx) = {debt_ebitda:.1f}x"
+                        ),
+                        "significance": "high",
+                        "direction": "negative",
+                    })
+                    score_adjustments -= 8
+                elif debt_ebitda < 1.5:
+                    inflections.append({
+                        "type": "low_leverage",
+                        "description": (
+                            f"Low leverage: Debt/EBITDA(approx) = {debt_ebitda:.1f}x"
+                        ),
+                        "significance": "low",
+                        "direction": "positive",
+                    })
+                    score_adjustments += 3
+
     # ---- Compute overall score ----
     inflection_score = max(1, min(100, 50 + score_adjustments))
 
@@ -742,6 +1042,18 @@ def format_inflection_for_prompt(inflection_data: Dict,
             lines.append(f"  Shares outstanding: {fs['latest_shares_outstanding']/1e6:.1f}M")
         if "latest_revenue_growth_pct" in fs:
             lines.append(f"  Revenue growth: {fs['latest_revenue_growth_pct']:.1f}% vs OpEx growth: {fs.get('latest_opex_growth_pct', 0):.1f}%")
+        if "latest_fcf" in fs:
+            lines.append(f"  Free cash flow: ${fs['latest_fcf']/1e6:.2f}M")
+        if "latest_dso" in fs:
+            lines.append(f"  Days sales outstanding: {fs['latest_dso']:.0f} days")
+        if "latest_deferred_revenue" in fs:
+            lines.append(f"  Deferred revenue: ${fs['latest_deferred_revenue']/1e6:.1f}M")
+        if "latest_sbc_pct_revenue" in fs:
+            lines.append(f"  SBC as % of revenue: {fs['latest_sbc_pct_revenue']:.1f}%")
+        if "latest_interest_coverage" in fs:
+            lines.append(f"  Interest coverage: {fs['latest_interest_coverage']:.1f}x")
+        if "debt_to_ebitda_approx" in fs:
+            lines.append(f"  Debt/EBITDA (approx): {fs['debt_to_ebitda_approx']:.1f}x")
         lines.append("")
 
     # Inflection points
